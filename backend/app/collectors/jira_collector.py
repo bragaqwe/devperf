@@ -1,10 +1,10 @@
 """
-Jira data collector — REST API v3. VERSION 4.
+Jira data collector — REST API v3. VERSION 5.
 /rest/api/3/search (GET) — отключён в этом Jira Cloud instance (410).
 Используем ТОЛЬКО POST /rest/api/3/search/jql без expand=changelog.
 Changelog тянем отдельно через GET /rest/api/3/issue/{key}/changelog.
+Пагинация: сначала пробуем nextPageToken (cursor-based), затем startAt (offset).
 """
-import uuid
 import logging
 from datetime import datetime
 from typing import Any
@@ -17,12 +17,19 @@ from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
-FIELDS = [
+# Только гарантированно существующие стандартные поля.
+# Кастомные поля (story points) запрашиваем отдельно через field-lookup,
+# чтобы не получать 400 "Invalid request payload" если поля нет в проекте.
+FIELDS_STANDARD = [
     "summary", "status", "assignee", "reporter", "priority",
     "issuetype", "created", "updated", "resolutiondate",
-    "labels", "duedate",
-    "customfield_10016",
-    "customfield_10028",
+]
+# Кандидаты на story points — пробуем все известные варианты
+STORY_POINTS_FIELDS = [
+    "customfield_10016",  # Jira Software (классический)
+    "customfield_10028",  # Jira Next-gen / newer cloud
+    "customfield_10034",  # некоторые инстансы
+    "story_points",       # некоторые конфигурации
 ]
 
 
@@ -49,7 +56,7 @@ class JiraCollector:
             "Accept": "application/json",
             "Content-Type": "application/json",
         }
-        print(self.headers)
+        logger.debug("JiraCollector initialized for %s", self.base_url)
 
     @retry(
         retry=retry_if_exception(_is_retryable),
@@ -86,40 +93,57 @@ class JiraCollector:
             ts = updated_after.strftime("%Y-%m-%d %H:%M")
             jql = f"project = {project_key} AND updated >= '{ts}' ORDER BY updated DESC"
 
-        start_at = 0
-        page_size = 50
-        all_raw = []
+        page_size  = 50
+        fetched    = 0
+        all_raw    = []
+        next_page_token: str | None = None
 
         async with httpx.AsyncClient(timeout=60) as client:
-            # ШАГ 1 — POST /search/jql БЕЗ expand
-            while start_at < max_results:
-                body = {
-                    "jql": jql,
-                    # "startAt": start_at,
+            # Определяем доступные story points поля один раз
+            sp_field = await self._detect_story_points_field(client)
+            fields_to_fetch = list(FIELDS_STANDARD)
+            if sp_field:
+                fields_to_fetch.append(sp_field)
+
+            # ШАГ 1 — POST /search/jql
+            # ВАЖНО: POST /search/jql (новый Cloud API) НЕ поддерживает startAt.
+            # Отправка startAt вызывает 400 "Invalid request payload".
+            # Пагинация только через nextPageToken из ответа.
+            while fetched < max_results:
+                body: dict = {
+                    "jql":        jql,
                     "maxResults": page_size,
-                    "fields": FIELDS,
-                    
-                    # НЕТ "expand" — именно это вызывало 400
+                    "fields":     fields_to_fetch,
+                    # startAt — НЕ отправляем (400 на Cloud API)
+                    # expand  — НЕ отправляем (400)
                 }
+                if next_page_token:
+                    body["nextPageToken"] = next_page_token
+
                 data = await self._post(
                     client,
                     f"{self.base_url}/rest/api/3/search/jql",
-                    body=body
+                    body=body,
                 )
-
-                print("RESULT", data)
-                
-
 
                 issues = data.get("issues", [])
                 if not issues:
                     break
 
                 all_raw.extend(issues)
-                start_at += len(issues)
-                total = data.get("total", 0)
-                logger.info(f"  Jira: fetched {start_at}/{total}")
-                if start_at >= total:
+                fetched += len(issues)
+
+                total     = data.get("total")          # offset API
+                is_last   = data.get("isLast", False)  # cursor API
+                next_page_token = data.get("nextPageToken")  # cursor API
+
+                logger.info("  Jira: fetched %d%s", fetched,
+                            f"/{total}" if total is not None else "")
+
+                if is_last or not next_page_token and (
+                    (total is not None and fetched >= total)
+                    or len(issues) < page_size
+                ):
                     break
 
             # ШАГ 2 — Changelog для каждого issue отдельно
@@ -129,10 +153,24 @@ class JiraCollector:
                 raw["_changelog_entries"] = entries
                 result.append(self._parse_issue(raw))
                 if (i + 1) % 10 == 0:
-                    logger.info(f"  Changelog: {i + 1}/{len(all_raw)}")
+                    logger.info("  Changelog: %d/%d", i + 1, len(all_raw))
 
-        logger.info(f"  Jira done: {len(result)} issues")
+        logger.info("  Jira done: %d issues", len(result))
         return result
+
+    async def _detect_story_points_field(self, client: httpx.AsyncClient) -> str | None:
+        """Определяет какой custom field используется для story points в этом инстансе."""
+        try:
+            fields = await self._get(client, f"{self.base_url}/rest/api/3/field")
+            for f in fields:
+                name = (f.get("name") or "").lower()
+                if "story" in name and "point" in name:
+                    logger.info("  Story points field: %s (%s)", f["id"], f["name"])
+                    return f["id"]
+        except Exception as e:
+            logger.warning("  Cannot detect story points field: %s", e)
+        # Fallback — попробуем классический вариант
+        return "customfield_10016"
 
     async def _fetch_changelog(self, client: httpx.AsyncClient, issue_key: str) -> list:
         entries = []
@@ -150,20 +188,17 @@ class JiraCollector:
                 if start_at >= data.get("total", 0) or not page:
                     break
             except httpx.HTTPStatusError as e:
-                logger.warning(f"  Changelog {issue_key}: {e.response.status_code}")
+                logger.warning("  Changelog %s: %s", issue_key, e.response.status_code)
                 break
         return entries
-    from datetime import datetime
 
     def _parse_jira_datetime(self, dt_str: str | None) -> datetime | None:
         if not dt_str:
             return None
         try:
-            # Jira возвращает формат вида: "2026-02-26T14:23:00.000+0000"
             return datetime.strptime(dt_str, "%Y-%m-%dT%H:%M:%S.%f%z")
         except ValueError:
             try:
-                # Иногда может быть без миллисекунд
                 return datetime.strptime(dt_str, "%Y-%m-%dT%H:%M:%S%z")
             except ValueError:
                 return None
@@ -173,56 +208,53 @@ class JiraCollector:
         changelog_entries = raw.get("_changelog_entries", [])
 
         transitions = self._parse_transitions(raw["id"], changelog_entries)
-        reopen_count = sum(
-            1 for t in transitions
-            if t["to_status"].lower() in ("open", "reopened", "to do", "backlog")
-            and t.get("from_status", "").lower() in ("done", "closed", "resolved")
-        )
 
         assignee = fields.get("assignee") or {}
-        story_points = fields.get("customfield_10016") or fields.get("customfield_10028")
-        if isinstance(story_points, (int, float)):
-            story_points = float(story_points)
-        else:
-            story_points = None
+        # Ищем story points в любом из известных кастомных полей
+        story_points = None
+        for sp_key in STORY_POINTS_FIELDS:
+            val = fields.get(sp_key)
+            if val is not None and isinstance(val, (int, float)):
+                story_points = float(val)
+                break
 
         return {
-    # "id": str(uuid.uuid4()),
-    "jira_id": raw["id"],
-    "key": raw["key"],
-    "project_key": raw["key"].split("-")[0],
-    "issue_type": (fields.get("issuetype") or {}).get("name", "Unknown"),
-    "summary": fields.get("summary", ""),
-    "status": (fields.get("status") or {}).get("name", "Unknown"),
-    "assignee_account_id": assignee.get("accountId"),
-    "reporter_account_id": (fields.get("reporter") or {}).get("accountId"),
-    "priority": (fields.get("priority") or {}).get("name"),
-    "story_points": story_points,
-    "created_at": self._parse_jira_datetime(fields.get("created")),
-    "updated_at": self._parse_jira_datetime(fields.get("updated")),
-    "resolved_at": self._parse_jira_datetime(fields.get("resolutiondate")),
-    "due_date": self._parse_jira_datetime(fields.get("duedate")),
-    "reopen_count": reopen_count,
-    "labels": fields.get("labels", []),
-    "raw_data": raw,
-    "transitions": transitions,
-}
+            "jira_id":             raw["id"],
+            "key":                 raw["key"],
+            "project_key":         raw["key"].split("-")[0],
+            "issue_type":          (fields.get("issuetype") or {}).get("name", "Unknown"),
+            "summary":             fields.get("summary", ""),
+            "status":              (fields.get("status") or {}).get("name", "Unknown"),
+            "assignee_account_id": assignee.get("accountId"),
+            "reporter_account_id": (fields.get("reporter") or {}).get("accountId"),
+            "priority":            (fields.get("priority") or {}).get("name"),
+            "story_points":        story_points,
+            "created_at":          self._parse_jira_datetime(fields.get("created")),
+            "updated_at":          self._parse_jira_datetime(fields.get("updated")),
+            "resolved_at":         self._parse_jira_datetime(fields.get("resolutiondate")),
+            "raw_data":            raw,
+            "transitions":         transitions,
+        }
 
     def _parse_transitions(self, issue_id: str, entries: list) -> list[dict]:
         transitions = []
         for history in entries:
             for item in history.get("items", []):
                 if item.get("field") == "status":
+                    try:
+                        transitioned_at = datetime.strptime(
+                            history.get("created"), "%Y-%m-%dT%H:%M:%S.%f%z"
+                        )
+                    except (ValueError, TypeError):
+                        continue
                     transitions.append({
-                        # "id": str(uuid.uuid4()),
-                        "issue_id": issue_id,
-                        "from_status": item.get("fromString"),
-                        "to_status": item.get("toString", ""),
-                        "author_account_id": (history.get("author") or {}).get("accountId"),
-                        "transitioned_at": datetime.strptime(history.get("created"),   "%Y-%m-%dT%H:%M:%S.%f%z"),
+                        "issue_id":           issue_id,
+                        "from_status":        item.get("fromString"),
+                        "to_status":          item.get("toString", ""),
+                        "author_account_id":  (history.get("author") or {}).get("accountId"),
+                        "transitioned_at":    transitioned_at,
                     })
         return transitions
-    
 
     async def get_project_members(self, project_key: str) -> list[dict]:
         async with httpx.AsyncClient(timeout=30) as client:
@@ -234,12 +266,62 @@ class JiraCollector:
                 )
                 return [
                     {
-                        "account_id": u.get("accountId"),
+                        "account_id":   u.get("accountId"),
                         "display_name": u.get("displayName", ""),
-                        "email": u.get("emailAddress"),
+                        "email":        u.get("emailAddress"),
                     }
                     for u in data if u.get("accountId")
                 ]
             except Exception as e:
-                logger.warning(f"Members fetch failed: {e}")
+                logger.warning("Members fetch failed: %s", e)
                 return []
+
+    async def test_connection(self, project_key: str = "CORE") -> dict:
+        """Диагностика подключения к Jira: проверяем аутентификацию и доступ к проекту."""
+        result: dict = {
+            "base_url":    self.base_url,
+            "auth_ok":     False,
+            "project_ok":  False,
+            "issue_count": None,
+            "error":       None,
+        }
+        async with httpx.AsyncClient(timeout=30) as client:
+            # 1. Проверяем себя (текущий пользователь)
+            try:
+                me = await self._get(client, f"{self.base_url}/rest/api/3/myself")
+                result["auth_ok"]    = True
+                result["account_id"] = me.get("accountId")
+                result["email"]      = me.get("emailAddress")
+            except Exception as e:
+                result["error"] = f"Auth failed: {e}"
+                return result
+
+            # 2. Проверяем доступ к проекту
+            try:
+                proj = await self._get(
+                    client,
+                    f"{self.base_url}/rest/api/3/project/{project_key}",
+                )
+                result["project_ok"]   = True
+                result["project_name"] = proj.get("name")
+            except httpx.HTTPStatusError as e:
+                result["error"] = f"Project {project_key} not accessible: {e.response.status_code}"
+                return result
+
+            # 3. Сколько задач в проекте
+            try:
+                body = {
+                    "jql":        f"project = {project_key}",
+                    "maxResults": 1,
+                    "fields":     ["summary"],
+                }
+                data = await self._post(
+                    client,
+                    f"{self.base_url}/rest/api/3/search/jql",
+                    body=body,
+                )
+                result["issue_count"] = data.get("total")
+            except Exception as e:
+                result["error"] = f"Search failed: {e}"
+
+        return result

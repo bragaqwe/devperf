@@ -119,6 +119,29 @@ class DayActivityReport(BaseModel):
     timeline:          list[TimelineEvent]
 
 
+# ── BiWeekly Score ─────────────────────────────────────────────────────────────
+
+class BiWeeklyScoreOut(BaseModel):
+    id:                     int
+    developer_id:           int
+    period_start:           datetime
+    period_end:             datetime
+    delivery_score:         float
+    quality_score:          float
+    collaboration_score:    float
+    consistency_score:      float
+    velocity_trend:         float
+    overall_score:          float
+    burnout_risk_score:     float
+    burnout_risk_level:     str
+    after_hours_ratio:      float
+    weekend_activity_ratio: float
+    weeks_included:         int
+    delta_overall:          Optional[float] = None
+    computed_at:            Optional[datetime] = None
+    model_config = {"from_attributes": True}
+
+
 # ── Trend ──────────────────────────────────────────────────────────────────────
 
 class TrendPoint(BaseModel):
@@ -204,3 +227,39 @@ class SyncResponse(BaseModel):
     status:    str
     message:   str
     synced_at: datetime
+
+
+# ── PR Assessment (GigaChat) ───────────────────────────────────────────────────
+
+class PRAssessmentOut(BaseModel):
+    pr_id:             int
+    quality_score:     float
+    complexity_score:  float
+    quality_label:     str
+    complexity_label:  str
+    quality_reasons:   list[str]
+    complexity_reasons: list[str]
+    is_stub:           bool
+    ai_summary:        Optional[str] = None
+    assessed_at:       Optional[datetime] = None
+    model_config = {"from_attributes": True}
+
+
+# ── 1:1 Meeting ───────────────────────────────────────────────────────────────
+
+class OneOnOneTopic(BaseModel):
+    topic:    str
+    advice:   str
+    category: str
+    urgency:  int
+
+
+class OneOnOneMeetingOut(BaseModel):
+    id:          int
+    developer_id: int
+    created_at:  datetime
+    risk_level:  str
+    risk_score:  float
+    questions:   list[OneOnOneTopic]
+    notes:       Optional[str] = None
+    model_config = {"from_attributes": True}

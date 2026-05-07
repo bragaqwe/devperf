@@ -61,6 +61,7 @@ class Developer(Base):
     activities         = relationship("ActivityEvent",    back_populates="developer")
     daily_metrics      = relationship("DailyMetric",      back_populates="developer")
     performance_scores = relationship("PerformanceScore", back_populates="developer")
+    biweekly_scores    = relationship("BiWeeklyScore",    back_populates="developer")
 
 
 class GitHubPullRequest(Base):
@@ -259,3 +260,105 @@ class PerformanceScore(Base):
         UniqueConstraint("developer_id", "week_start", name="uq_perf_score_week"),
         Index("ix_perf_score_date", "week_start"),
     )
+
+
+class BiWeeklyScore(Base):
+    """Агрегированный score за двухнедельный период (среднее двух weekly scores)."""
+    __tablename__ = "biweekly_scores"
+    id                     = Column(Integer, primary_key=True, autoincrement=True)
+    developer_id           = Column(Integer, ForeignKey("developers.id"), nullable=False)
+    period_start           = Column(DateTime(timezone=True), nullable=False)  # первый день периода
+    period_end             = Column(DateTime(timezone=True), nullable=False)  # последний день (не включая)
+    delivery_score         = Column(Float, default=0.0)
+    quality_score          = Column(Float, default=0.0)
+    collaboration_score    = Column(Float, default=0.0)
+    consistency_score      = Column(Float, default=0.0)
+    velocity_trend         = Column(Float, default=0.0)
+    overall_score          = Column(Float, default=0.0)
+    burnout_risk_score     = Column(Float, default=0.0)
+    burnout_risk_level     = Column(String(20), default="low")
+    after_hours_ratio      = Column(Float, default=0.0)
+    weekend_activity_ratio = Column(Float, default=0.0)
+    weeks_included         = Column(Integer, default=2)   # сколько weekly records усреднено
+    delta_overall          = Column(Float, nullable=True) # разница с предыдущим периодом
+    computed_at            = Column(DateTime(timezone=True), server_default=func.now())
+    developer              = relationship("Developer", back_populates="biweekly_scores")
+    __table_args__ = (
+        UniqueConstraint("developer_id", "period_start", name="uq_biweekly_period"),
+        Index("ix_biweekly_period", "period_start"),
+    )
+
+
+class GitHubIssue(Base):
+    """GitHub Issues (не PR) — для отслеживания участия разработчика."""
+    __tablename__ = "github_issues"
+    id             = Column(Integer,    primary_key=True, autoincrement=True)
+    gh_id          = Column(BigInteger, nullable=False)
+    repo_full_name = Column(String(512), nullable=False)
+    number         = Column(Integer,    nullable=False)
+    title          = Column(Text,       nullable=False)
+    state          = Column(String(50), nullable=False)
+    author_login   = Column(String(255), nullable=True)
+    assignee_login = Column(String(255), nullable=True)
+    html_url       = Column(Text,       nullable=True)
+    created_at     = Column(DateTime(timezone=True), nullable=False)
+    updated_at     = Column(DateTime(timezone=True), nullable=True)
+    closed_at      = Column(DateTime(timezone=True), nullable=True)
+    labels         = Column(JSON, nullable=True)
+    comments_count = Column(Integer, default=0)
+    __table_args__ = (
+        UniqueConstraint("repo_full_name", "number", name="uq_gh_issue_repo_number"),
+        Index("ix_gh_issue_author",   "author_login"),
+        Index("ix_gh_issue_assignee", "assignee_login"),
+        Index("ix_gh_issue_date",     "created_at"),
+    )
+
+
+class GitHubIssueComment(Base):
+    """Комментарии к GitHub Issues (не PR-ревью)."""
+    __tablename__ = "github_issue_comments"
+    id             = Column(Integer,    primary_key=True, autoincrement=True)
+    gh_id          = Column(BigInteger, unique=True, nullable=False)
+    repo_full_name = Column(String(512), nullable=False)
+    issue_number   = Column(Integer,    nullable=True)
+    author_login   = Column(String(255), nullable=True)
+    body           = Column(Text,       nullable=True)
+    html_url       = Column(Text,       nullable=True)
+    created_at     = Column(DateTime(timezone=True), nullable=False)
+    updated_at     = Column(DateTime(timezone=True), nullable=True)
+    __table_args__ = (
+        Index("ix_gh_issue_comment_author", "author_login"),
+        Index("ix_gh_issue_comment_date",   "created_at"),
+    )
+
+
+class PRGigaChatAssessment(Base):
+    """Оценка PR через GigaChat (или заглушку)."""
+    __tablename__ = "pr_gigachat_assessments"
+    id               = Column(Integer, primary_key=True, autoincrement=True)
+    pr_id            = Column(Integer, ForeignKey("github_pull_requests.id"), nullable=False, unique=True)
+    quality_score    = Column(Float,  nullable=False)
+    complexity_score = Column(Float,  nullable=False)
+    quality_label    = Column(String(50), nullable=False)
+    complexity_label = Column(String(50), nullable=False)
+    quality_reasons  = Column(JSON,   nullable=True)
+    complexity_reasons = Column(JSON, nullable=True)
+    is_stub          = Column(Integer, default=1)
+    ai_summary       = Column(Text, nullable=True)
+    assessed_at      = Column(DateTime(timezone=True), server_default=func.now())
+    pull_request     = relationship("GitHubPullRequest")
+    __table_args__   = (Index("ix_pr_assessment_pr", "pr_id"),)
+
+
+class OneOnOneMeeting(Base):
+    """Записи о 1:1 встречах с вопросами, сгенерированными по risk score."""
+    __tablename__ = "one_on_one_meetings"
+    id           = Column(Integer, primary_key=True, autoincrement=True)
+    developer_id = Column(Integer, ForeignKey("developers.id"), nullable=False)
+    created_at   = Column(DateTime(timezone=True), server_default=func.now())
+    risk_level   = Column(String(20), nullable=False)
+    risk_score   = Column(Float,      nullable=False)
+    questions    = Column(JSON,       nullable=False)
+    notes        = Column(Text,       nullable=True)
+    developer    = relationship("Developer")
+    __table_args__ = (Index("ix_one_on_one_dev", "developer_id"),)

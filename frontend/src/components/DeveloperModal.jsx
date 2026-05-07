@@ -29,8 +29,8 @@ export default function DeveloperModal({ developer, teams, defaultTeamId, onClos
     <Modal title={developer ? 'Редактировать разработчика' : 'Добавить разработчика'} onClose={onClose}>
       <Input label="Имя *" value={name} onChange={setName} placeholder="Иван Петров" />
       <Select label="Команда *" value={teamId} onChange={setTeamId} options={teamOptions} />
-      <Input label="GitHub Login" value={ghLogin} onChange={setGhLogin} placeholder="ivan_dev" hint="Логин на github.com — фильтрует коммиты, PR и ревью" />
-      <Input label="Jira Account ID" value={jiraId} onChange={setJiraId} placeholder="622fc77c1f014e0069cc3bd1" hint='curl -u email:token https://org.atlassian.net/rest/api/3/myself → поле "accountId"' />
+      <Input label="GitHub логин" value={ghLogin} onChange={setGhLogin} placeholder="ivan_dev" hint="Логин на github.com — фильтрует коммиты, PR и ревью" />
+      <Input label="Jira Account ID" value={jiraId} onChange={setJiraId} placeholder="622fc77c1f014e0069cc3bd1" hint='curl -u email:token https://org.atlassian.net/rest/api/3/myself — поле "accountId"' />
       <Input label="Email" value={email} onChange={setEmail} placeholder="ivan@company.ru" type="email" />
       {error && <div style={{ color: T.red, fontSize: 12, marginBottom: 12 }}>{error}</div>}
       <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>

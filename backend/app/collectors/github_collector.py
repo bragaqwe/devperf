@@ -1,12 +1,5 @@
 """
-GitHub data collector — pulls PRs, commits, reviews via REST API.
-
-Изменения:
-  - PR list: после сбора делаем детальный GET /pulls/{number} для additions/deletions
-  - Commits list: после сбора делаем детальный GET /commits/{sha} для stats
-  - html_url добавлен во все объекты
-  - id убран (Integer PK генерирует PostgreSQL)
-  - Батчевые детальные запросы с concurrency-limit чтобы не бить rate limit
+GitHub data collector — PRs, commits, reviews, PR-comments, issues, issue-comments.
 """
 import asyncio
 import logging
@@ -21,9 +14,8 @@ from app.services.linker import link_pr_to_jira, link_commit_to_jira
 
 logger = logging.getLogger(__name__)
 
-GITHUB_API = "https://api.github.com"
-PER_PAGE   = 100
-# Максимум параллельных детальных запросов (осторожно с rate limit)
+GITHUB_API        = "https://api.github.com"
+PER_PAGE          = 100
 DETAIL_CONCURRENCY = 5
 
 
@@ -35,7 +27,7 @@ class GitHubCollector:
     def __init__(self, token: str | None = None):
         self.token = token or settings.GITHUB_TOKEN
         self.headers = {
-            "Accept":              "application/vnd.github+json",
+            "Accept":               "application/vnd.github+json",
             "X-GitHub-Api-Version": "2022-11-28",
         }
         if self.token:
@@ -72,18 +64,12 @@ class GitHubCollector:
                 break
             page += 1
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # Pull Requests
-    # ─────────────────────────────────────────────────────────────────────────
+    # ── Pull Requests ─────────────────────────────────────────────────────────
 
     async def collect_pull_requests(
         self, repo_full_name: str, since: datetime | None = None
     ) -> list[dict]:
-        """
-        Собирает все PR репозитория.
-        Для каждого PR делает детальный запрос чтобы получить
-        additions, deletions, changed_files (их нет в list endpoint).
-        """
+        """PRs с детальной статистикой (additions/deletions/changed_files)."""
         basic_prs: list[dict] = []
 
         async with httpx.AsyncClient(timeout=30) as client:
@@ -97,8 +83,6 @@ class GitHubCollector:
                         break
                 basic_prs.append(pr)
 
-            # Детальные данные (additions/deletions) — батчами по DETAIL_CONCURRENCY
-            results: list[dict] = []
             sem = asyncio.Semaphore(DETAIL_CONCURRENCY)
 
             async def _enrich_pr(pr_basic: dict) -> dict:
@@ -111,51 +95,43 @@ class GitHubCollector:
                     except Exception as e:
                         logger.warning("Cannot fetch PR detail %s#%s: %s",
                                        repo_full_name, pr_basic["number"], e)
-                        detail = pr_basic  # fallback — без статистики
+                        detail = pr_basic
 
                 jira_key = link_pr_to_jira(
-                    pr_title  = detail.get("title", ""),
-                    pr_body   = detail.get("body"),
+                    pr_title    = detail.get("title", ""),
+                    pr_body     = detail.get("body"),
                     branch_name = detail.get("head", {}).get("ref"),
                 )
                 return {
-                    # id не указываем — autoincrement в PostgreSQL
-                    "gh_id":          detail["id"],
-                    "repo_full_name": repo_full_name,
-                    "number":         detail["number"],
-                    "title":          detail["title"],
-                    "state":          detail["state"],
-                    "author_login":   (detail.get("user") or {}).get("login"),
-                    "html_url":       detail.get("html_url", ""),
-                    "created_at":     _parse_gh_dt(detail.get("created_at", "")),
-                    "merged_at":      _parse_gh_dt(detail.get("merged_at")) if detail.get("merged_at") else None,
-                    "closed_at":      _parse_gh_dt(detail.get("closed_at"))  if detail.get("closed_at")  else None,
-                    "additions":      detail.get("additions", 0) or 0,
-                    "deletions":      detail.get("deletions", 0) or 0,
-                    "changed_files":  detail.get("changed_files", 0) or 0,
-                    "review_comments":detail.get("review_comments", 0) or 0,
-                    "commits_count":  detail.get("commits", 0) or 0,
-                    "jira_issue_key": jira_key,
+                    "gh_id":           detail["id"],
+                    "repo_full_name":  repo_full_name,
+                    "number":          detail["number"],
+                    "title":           detail["title"],
+                    "state":           detail["state"],
+                    "author_login":    (detail.get("user") or {}).get("login"),
+                    "html_url":        detail.get("html_url", ""),
+                    "created_at":      _parse_gh_dt(detail.get("created_at", "")),
+                    "merged_at":       _parse_gh_dt(detail.get("merged_at"))  if detail.get("merged_at")  else None,
+                    "closed_at":       _parse_gh_dt(detail.get("closed_at"))  if detail.get("closed_at")  else None,
+                    "additions":       detail.get("additions", 0)       or 0,
+                    "deletions":       detail.get("deletions", 0)       or 0,
+                    "changed_files":   detail.get("changed_files", 0)   or 0,
+                    "review_comments": detail.get("review_comments", 0) or 0,
+                    "commits_count":   detail.get("commits", 0)         or 0,
+                    "jira_issue_key":  jira_key,
                 }
 
-            tasks = [_enrich_pr(pr) for pr in basic_prs]
-            results = await asyncio.gather(*tasks)
+            results = await asyncio.gather(*[_enrich_pr(pr) for pr in basic_prs])
 
-        logger.info("GitHub %s: collected %d PRs (with stats)", repo_full_name, len(results))
+        logger.info("GitHub %s: collected %d PRs", repo_full_name, len(results))
         return list(results)
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # Commits
-    # ─────────────────────────────────────────────────────────────────────────
+    # ── Commits ───────────────────────────────────────────────────────────────
 
     async def collect_commits(
         self, repo_full_name: str, since: datetime | None = None
     ) -> list[dict]:
-        """
-        Собирает коммиты репозитория.
-        Для каждого коммита делает детальный запрос чтобы получить
-        stats.additions / stats.deletions (их нет в list endpoint).
-        """
+        """Коммиты с детальной статистикой (additions/deletions)."""
         basic_commits: list[dict] = []
 
         async with httpx.AsyncClient(timeout=30) as client:
@@ -167,7 +143,6 @@ class GitHubCollector:
             async for commit in self._paginate(client, url, params):
                 basic_commits.append(commit)
 
-            # Детальные данные — батчами
             sem = asyncio.Semaphore(DETAIL_CONCURRENCY)
 
             async def _enrich_commit(c_basic: dict) -> dict:
@@ -190,53 +165,112 @@ class GitHubCollector:
                 message  = c_obj.get("message", "")
 
                 return {
-                    # id не указываем — autoincrement
-                    "sha":           sha,
+                    "sha":            sha,
                     "repo_full_name": repo_full_name,
-                    "author_login":  author.get("login"),
-                    "author_email":  c_author.get("email"),
-                    "message":       message,
-                    "html_url":      detail.get("html_url", ""),
-                    "committed_at":  _parse_gh_dt(c_author.get("date", "")),
-                    "additions":     stats.get("additions", 0) or 0,
-                    "deletions":     stats.get("deletions", 0) or 0,
+                    "author_login":   author.get("login"),
+                    "author_email":   c_author.get("email"),
+                    "message":        message,
+                    "html_url":       detail.get("html_url", ""),
+                    "committed_at":   _parse_gh_dt(c_author.get("date", "")),
+                    "additions":      stats.get("additions", 0) or 0,
+                    "deletions":      stats.get("deletions", 0) or 0,
                     "jira_issue_key": link_commit_to_jira(message),
                 }
 
-            tasks   = [_enrich_commit(c) for c in basic_commits]
-            results = await asyncio.gather(*tasks)
+            results = await asyncio.gather(*[_enrich_commit(c) for c in basic_commits])
 
-        logger.info("GitHub %s: collected %d commits (with stats)", repo_full_name, len(results))
+        logger.info("GitHub %s: collected %d commits", repo_full_name, len(results))
         return list(results)
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # Reviews
-    # ─────────────────────────────────────────────────────────────────────────
+    # ── Reviews ───────────────────────────────────────────────────────────────
 
     async def collect_reviews(
         self, repo_full_name: str, pr_number: int, pr_db_id: int
     ) -> list[dict]:
-        """Собирает ревью для конкретного PR."""
+        """Ревью для конкретного PR."""
         url     = f"{GITHUB_API}/repos/{repo_full_name}/pulls/{pr_number}/reviews"
         results = []
-
         async with httpx.AsyncClient(timeout=30) as client:
             async for review in self._paginate(client, url):
                 results.append({
-                    # id не указываем — autoincrement
-                    "gh_id":           review["id"],
-                    "pr_id":           pr_db_id,
-                    "reviewer_login":  (review.get("user") or {}).get("login"),
-                    "state":           review["state"],
-                    "html_url":        review.get("html_url", ""),
-                    "submitted_at":    _parse_gh_dt(review.get("submitted_at", "")),
-                    "body":            review.get("body"),
+                    "gh_id":          review["id"],
+                    "pr_id":          pr_db_id,
+                    "reviewer_login": (review.get("user") or {}).get("login"),
+                    "state":          review["state"],
+                    "html_url":       review.get("html_url", ""),
+                    "submitted_at":   _parse_gh_dt(review.get("submitted_at", "")),
+                    "body":           review.get("body"),
                 })
         return results
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # Org repos
-    # ─────────────────────────────────────────────────────────────────────────
+    # ── Issues ────────────────────────────────────────────────────────────────
+
+    async def collect_issues(
+        self, repo_full_name: str, since: datetime | None = None
+    ) -> list[dict]:
+        """
+        Все issues репозитория (включая закрытые).
+        Pull requests в GitHub тоже являются issues — фильтруем их по наличию pull_request.
+        """
+        url    = f"{GITHUB_API}/repos/{repo_full_name}/issues"
+        params: dict = {"state": "all", "sort": "updated", "direction": "desc"}
+        if since:
+            params["since"] = since.isoformat()
+
+        results = []
+        async with httpx.AsyncClient(timeout=30) as client:
+            async for item in self._paginate(client, url, params):
+                if "pull_request" in item:
+                    continue  # Это PR, не issue
+                assignee = item.get("assignee") or {}
+                results.append({
+                    "gh_id":           item["id"],
+                    "repo_full_name":  repo_full_name,
+                    "number":          item["number"],
+                    "title":           item.get("title", ""),
+                    "state":           item.get("state", "open"),
+                    "author_login":    (item.get("user") or {}).get("login"),
+                    "assignee_login":  assignee.get("login"),
+                    "html_url":        item.get("html_url", ""),
+                    "created_at":      _parse_gh_dt(item.get("created_at", "")),
+                    "updated_at":      _parse_gh_dt(item.get("updated_at", "")),
+                    "closed_at":       _parse_gh_dt(item.get("closed_at")) if item.get("closed_at") else None,
+                    "labels":          [l["name"] for l in (item.get("labels") or [])],
+                    "comments_count":  item.get("comments", 0),
+                })
+
+        logger.info("GitHub %s: collected %d issues", repo_full_name, len(results))
+        return results
+
+    # ── Issue comments ────────────────────────────────────────────────────────
+
+    async def collect_issue_comments(
+        self, repo_full_name: str, since: datetime | None = None
+    ) -> list[dict]:
+        """Все комментарии к issues (не PR-ревью)."""
+        url    = f"{GITHUB_API}/repos/{repo_full_name}/issues/comments"
+        params: dict = {"sort": "updated", "direction": "desc"}
+        if since:
+            params["since"] = since.isoformat()
+
+        results = []
+        async with httpx.AsyncClient(timeout=30) as client:
+            async for item in self._paginate(client, url, params):
+                results.append({
+                    "gh_id":          item["id"],
+                    "repo_full_name": repo_full_name,
+                    "author_login":   (item.get("user") or {}).get("login"),
+                    "html_url":       item.get("html_url", ""),
+                    "created_at":     _parse_gh_dt(item.get("created_at", "")),
+                    "updated_at":     _parse_gh_dt(item.get("updated_at", "")),
+                    "body":           (item.get("body") or "")[:500],
+                    "issue_number":   _extract_issue_number(item.get("issue_url", "")),
+                })
+
+        logger.info("GitHub %s: collected %d issue comments", repo_full_name, len(results))
+        return results
+
+    # ── Org repos ─────────────────────────────────────────────────────────────
 
     async def get_repos_for_org(self, org: str) -> list[str]:
         """Список репозиториев организации."""
@@ -247,8 +281,33 @@ class GitHubCollector:
                 repos.append(repo["full_name"])
         return repos
 
+    async def get_pr_diff(self, repo: str, pr_number: int, max_chars: int = 4000) -> str | None:
+        """Возвращает unified diff PR, обрезанный до max_chars."""
+        url = f"{GITHUB_API}/repos/{repo}/pulls/{pr_number}"
+        headers = {**self.headers, "Accept": "application/vnd.github.v3.diff"}
+        try:
+            async with httpx.AsyncClient(timeout=20) as client:
+                resp = await client.get(url, headers=headers)
+                if resp.status_code != 200:
+                    return None
+                diff = resp.text
+                if len(diff) > max_chars:
+                    diff = diff[:max_chars] + "\n... (diff обрезан)"
+                return diff
+        except Exception:
+            return None
 
-# ─────────────────────────────────────────────────────────────────────────────
+    async def get_repos_for_user(self, username: str) -> list[str]:
+        """Список публичных и приватных репозиториев пользователя."""
+        url   = f"{GITHUB_API}/users/{username}/repos"
+        repos = []
+        async with httpx.AsyncClient(timeout=30) as client:
+            async for repo in self._paginate(client, url, {"type": "all", "sort": "updated"}):
+                repos.append(repo["full_name"])
+        return repos
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _parse_gh_dt(value: str | None) -> datetime | None:
     if not value:
@@ -256,4 +315,15 @@ def _parse_gh_dt(value: str | None) -> datetime | None:
     try:
         return datetime.fromisoformat(value.replace("Z", "+00:00"))
     except Exception:
+        return None
+
+
+def _extract_issue_number(issue_url: str) -> int | None:
+    """Извлекает номер issue из URL вида .../issues/123."""
+    if not issue_url:
+        return None
+    parts = issue_url.rstrip("/").split("/")
+    try:
+        return int(parts[-1])
+    except (ValueError, IndexError):
         return None

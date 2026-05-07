@@ -5,6 +5,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.core.config import settings
 from app.db.session import init_db
 from app.api.routes import router
+from app.api.seed import seed_router
 
 logging.basicConfig(level=logging.INFO,
     format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s")
@@ -15,19 +16,6 @@ logger = logging.getLogger(__name__)
 async def lifespan(app: FastAPI):
     logger.info("DevPerf API starting — initializing DB…")
     await init_db()
-
-    from app.db.session import AsyncSessionLocal
-    from app.db.models import Developer
-    from sqlalchemy import select, func
-
-    async with AsyncSessionLocal() as session:
-        count = await session.scalar(select(func.count()).select_from(Developer))
-        if count == 0:
-            logger.info("Empty DB — seeding demo data…")
-            from app.services.seed_data import run_seed
-            await run_seed(session)
-            logger.info("Demo data seeded.")
-
     logger.info("DevPerf API ready.")
     yield
     logger.info("Shutting down.")
@@ -43,6 +31,7 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"],
     allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 app.include_router(router, prefix=settings.API_PREFIX)
+app.include_router(seed_router, prefix=settings.API_PREFIX)
 
 
 @app.get("/health")

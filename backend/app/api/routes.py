@@ -9,16 +9,19 @@ logger = logging.getLogger(__name__)
 
 from app.db.session import get_db
 from app.db.models import (
-    Department, Developer, Team, DailyMetric, PerformanceScore,
+    Department, Developer, Team, DailyMetric, PerformanceScore, BiWeeklyScore,
     GitHubCommit, GitHubPullRequest, GitHubReview, GitHubComment,
+    GitHubIssue, GitHubIssueComment,
+    PRGigaChatAssessment, OneOnOneMeeting,
     JiraIssue, JiraTransition, ActivityEvent, ActivityType,
 )
 from app.models.schemas import (
     DepartmentOut, DeveloperOut, TeamOut,
-    DailyMetricOut, PerformanceScoreOut,
+    DailyMetricOut, PerformanceScoreOut, BiWeeklyScoreOut,
     TrendPoint, BurnoutAlert, SyncResponse,
     DayActivityReport, TimelineEvent,
     TeamReport, MemberSnapshot, TeamWeeklyPoint,
+    PRAssessmentOut, OneOnOneMeetingOut, OneOnOneTopic,
 )
 
 router = APIRouter()
@@ -324,11 +327,13 @@ async def sync_developer(
                     repos = (await gh.get_repos_for_org(team.github_org))[:10]
                 except Exception as e:
                     messages.append(f"Org repos: {e}")
-        pr_count = commit_count = review_count = 0
+        pr_count = commit_count = review_count = issue_count = issue_comment_count = 0
         for repo in repos:
             try:
+                # PRs автора
                 all_prs = await gh.collect_pull_requests(repo, since=since)
-                for pr_data in [p for p in all_prs if p.get("author_login") == dev.github_login]:
+                dev_prs = [p for p in all_prs if p.get("author_login") == dev.github_login]
+                for pr_data in dev_prs:
                     rd = pr_data.pop("raw_data", None)
                     ex = (await db.execute(select(GitHubPullRequest).where(
                         GitHubPullRequest.repo_full_name == repo,
@@ -341,6 +346,8 @@ async def sync_developer(
                             if k != "id": setattr(ex, k, v)
                     pr_count += 1
                 await db.flush()
+
+                # Ревью разработчика на чужих PR
                 for pr in all_prs:
                     pr_res = (await db.execute(select(GitHubPullRequest).where(
                         GitHubPullRequest.repo_full_name == repo,
@@ -353,16 +360,80 @@ async def sync_developer(
                                 select(GitHubReview).where(GitHubReview.gh_id == rv["gh_id"])
                             )).scalar_one_or_none():
                                 db.add(GitHubReview(**rv)); review_count += 1
+
+                # Коммиты
                 commits = await gh.collect_commits(repo, since=since)
                 for c in [x for x in commits if x.get("author_login") == dev.github_login]:
                     if not (await db.execute(
                         select(GitHubCommit).where(GitHubCommit.sha == c["sha"])
                     )).scalar_one_or_none():
                         db.add(GitHubCommit(**c)); commit_count += 1
+
+                # GitHub Issues — созданные и назначенные разработчику
+                issues = await gh.collect_issues(repo, since=since)
+                for iss in issues:
+                    if iss.get("author_login") != dev.github_login and iss.get("assignee_login") != dev.github_login:
+                        continue
+                    ex = (await db.execute(select(GitHubIssue).where(
+                        GitHubIssue.repo_full_name == repo,
+                        GitHubIssue.number == iss["number"],
+                    ))).scalar_one_or_none()
+                    if not ex:
+                        db.add(GitHubIssue(**iss)); issue_count += 1
+                    else:
+                        for k, v in iss.items():
+                            if k != "id": setattr(ex, k, v)
+
+                # Комментарии к issues
+                issue_comments = await gh.collect_issue_comments(repo, since=since)
+                for ic in [x for x in issue_comments if x.get("author_login") == dev.github_login]:
+                    if not (await db.execute(
+                        select(GitHubIssueComment).where(GitHubIssueComment.gh_id == ic["gh_id"])
+                    )).scalar_one_or_none():
+                        db.add(GitHubIssueComment(**ic)); issue_comment_count += 1
+
             except Exception as e:
                 messages.append(f"GitHub {repo}: {e}")
+
         await db.flush()
-        messages.append(f"GitHub: {pr_count} PRs, {commit_count} коммитов, {review_count} ревью")
+
+        # Автооценка всех новых PR через GigaChat
+        try:
+            from app.services.gigachat import get_gigachat
+            svc = get_gigachat()
+            new_prs = (await db.execute(
+                select(GitHubPullRequest)
+                .outerjoin(PRGigaChatAssessment, PRGigaChatAssessment.pr_id == GitHubPullRequest.id)
+                .where(
+                    GitHubPullRequest.author_login == dev.github_login,
+                    GitHubPullRequest.created_at >= since,
+                    PRGigaChatAssessment.id.is_(None),
+                )
+            )).scalars().all()
+            from app.collectors.github_collector import GitHubCollector
+            gh_col = GitHubCollector()
+            for pr in new_prs:
+                diff = await gh_col.get_pr_diff(pr.repo_full_name, pr.number)
+                result = await svc.assess_pr(
+                    title=pr.title, body=None,
+                    additions=pr.additions or 0, deletions=pr.deletions or 0,
+                    changed_files=pr.changed_files or 0,
+                    review_comments=pr.review_comments or 0,
+                    commits_count=pr.commits_count or 0,
+                    diff=diff,
+                )
+                db.add(PRGigaChatAssessment(
+                    pr_id=pr.id,
+                    quality_score=result.quality_score, complexity_score=result.complexity_score,
+                    quality_label=result.quality_label, complexity_label=result.complexity_label,
+                    quality_reasons=result.quality_reasons, complexity_reasons=result.complexity_reasons,
+                    ai_summary=result.ai_summary,
+                    is_stub=int(result.is_stub),
+                ))
+            await db.flush()
+            messages.append(f"GitHub: {pr_count} PRs, {commit_count} коммитов, {review_count} ревью, {issue_count} issues, {issue_comment_count} комментариев, {len(new_prs)} PR оценено")
+        except Exception as e:
+            messages.append(f"GitHub: {pr_count} PRs, {commit_count} коммитов, {review_count} ревью (оценка PR: {e})")
     else:
         messages.append("GitHub: пропущено")
 
@@ -448,6 +519,22 @@ async def get_developer_scores(
         .where(PerformanceScore.developer_id == developer_id,
                PerformanceScore.week_start >= since)
         .order_by(PerformanceScore.week_start)
+    )).scalars().all()
+
+
+@router.get("/developers/{developer_id}/biweekly-scores", response_model=list[BiWeeklyScoreOut])
+async def get_biweekly_scores(
+    developer_id: int,
+    periods: int = Query(default=12, ge=1, le=52, description="Количество двухнедельных периодов"),
+    db: AsyncSession = Depends(get_db),
+):
+    """История оценок разработчика по двухнедельным периодам."""
+    since = datetime.now(tz=timezone.utc) - timedelta(weeks=periods * 2)
+    return (await db.execute(
+        select(BiWeeklyScore)
+        .where(BiWeeklyScore.developer_id == developer_id,
+               BiWeeklyScore.period_start >= since)
+        .order_by(BiWeeklyScore.period_start)
     )).scalars().all()
 
 
@@ -774,14 +861,223 @@ async def get_burnout_alerts(
     return sorted(alerts, key=lambda a: a.burnout_risk_score, reverse=True)
 
 
-# ── Seed ─────────────────────────────────────────────────────────────────────
 
-@router.post("/sync", response_model=SyncResponse)
-async def trigger_seed(db: AsyncSession = Depends(get_db)):
-    from app.services.seed_data import run_seed
-    await run_seed(db)
-    return SyncResponse(status="ok", message="Демо-данные загружены",
-                        synced_at=datetime.now(tz=timezone.utc))
+# ══════════════════════════════════════════════════════════════════════════════
+# PR ASSESSMENTS (GigaChat)
+# ══════════════════════════════════════════════════════════════════════════════
+
+@router.get("/pull-requests/{pr_id}/assessment", response_model=PRAssessmentOut)
+async def get_pr_assessment(pr_id: int, db: AsyncSession = Depends(get_db)):
+    """Получить или создать оценку PR (качество + сложность)."""
+    pr = await db.get(GitHubPullRequest, pr_id)
+    if not pr:
+        raise HTTPException(404, "Pull request not found")
+
+    existing = (await db.execute(
+        select(PRGigaChatAssessment).where(PRGigaChatAssessment.pr_id == pr_id)
+    )).scalar_one_or_none()
+
+    if existing:
+        return _assessment_to_out(existing)
+
+    from app.services.gigachat import get_gigachat
+    from app.collectors.github_collector import GitHubCollector
+    svc = get_gigachat()
+    diff = await GitHubCollector().get_pr_diff(pr.repo_full_name, pr.number)
+    result = await svc.assess_pr(
+        title           = pr.title,
+        body            = None,
+        additions       = pr.additions or 0,
+        deletions       = pr.deletions or 0,
+        changed_files   = pr.changed_files or 0,
+        review_comments = pr.review_comments or 0,
+        commits_count   = pr.commits_count or 0,
+        diff            = diff,
+    )
+
+    assessment = PRGigaChatAssessment(
+        pr_id            = pr_id,
+        quality_score    = result.quality_score,
+        complexity_score = result.complexity_score,
+        quality_label    = result.quality_label,
+        complexity_label = result.complexity_label,
+        quality_reasons  = result.quality_reasons,
+        complexity_reasons = result.complexity_reasons,
+        ai_summary       = result.ai_summary,
+        is_stub          = int(result.is_stub),
+    )
+    db.add(assessment)
+    await db.commit()
+    await db.refresh(assessment)
+    return _assessment_to_out(assessment)
+
+
+@router.post("/pull-requests/{pr_id}/assessment/refresh", response_model=PRAssessmentOut)
+async def refresh_pr_assessment(pr_id: int, db: AsyncSession = Depends(get_db)):
+    """Пересчитать оценку PR."""
+    pr = await db.get(GitHubPullRequest, pr_id)
+    if not pr:
+        raise HTTPException(404, "Pull request not found")
+
+    await db.execute(
+        delete(PRGigaChatAssessment).where(PRGigaChatAssessment.pr_id == pr_id)
+    )
+    await db.commit()
+
+    from app.services.gigachat import get_gigachat
+    from app.collectors.github_collector import GitHubCollector
+    svc = get_gigachat()
+    diff = await GitHubCollector().get_pr_diff(pr.repo_full_name, pr.number)
+    result = await svc.assess_pr(
+        title=pr.title, body=None,
+        additions=pr.additions or 0, deletions=pr.deletions or 0,
+        changed_files=pr.changed_files or 0,
+        review_comments=pr.review_comments or 0,
+        commits_count=pr.commits_count or 0,
+        diff=diff,
+    )
+    assessment = PRGigaChatAssessment(
+        pr_id=pr_id,
+        quality_score=result.quality_score, complexity_score=result.complexity_score,
+        quality_label=result.quality_label, complexity_label=result.complexity_label,
+        quality_reasons=result.quality_reasons, complexity_reasons=result.complexity_reasons,
+        ai_summary=result.ai_summary,
+        is_stub=int(result.is_stub),
+    )
+    db.add(assessment)
+    await db.commit()
+    await db.refresh(assessment)
+    return _assessment_to_out(assessment)
+
+
+@router.get("/developers/{developer_id}/pull-requests", response_model=list[dict])
+async def get_developer_prs(
+    developer_id: int,
+    days: int = Query(default=30, ge=1, le=365),
+    db: AsyncSession = Depends(get_db),
+):
+    """Список PR разработчика с оценками GigaChat (если есть)."""
+    dev = await db.get(Developer, developer_id)
+    if not dev:
+        raise HTTPException(404, "Developer not found")
+
+    since = datetime.now(tz=timezone.utc) - timedelta(days=days)
+    prs = (await db.execute(
+        select(GitHubPullRequest)
+        .where(GitHubPullRequest.author_login == dev.github_login,
+               GitHubPullRequest.created_at >= since)
+        .order_by(GitHubPullRequest.created_at.desc())
+    )).scalars().all()
+
+    result = []
+    for pr in prs:
+        assessment = (await db.execute(
+            select(PRGigaChatAssessment).where(PRGigaChatAssessment.pr_id == pr.id)
+        )).scalar_one_or_none()
+
+        result.append({
+            "id":             pr.id,
+            "number":         pr.number,
+            "title":          pr.title,
+            "state":          pr.state,
+            "repo":           pr.repo_full_name,
+            "html_url":       pr.html_url,
+            "created_at":     pr.created_at,
+            "merged_at":      pr.merged_at,
+            "additions":      pr.additions,
+            "deletions":      pr.deletions,
+            "changed_files":  pr.changed_files,
+            "review_comments": pr.review_comments,
+            "assessment": {
+                "quality_score":    assessment.quality_score,
+                "complexity_score": assessment.complexity_score,
+                "quality_label":    assessment.quality_label,
+                "complexity_label": assessment.complexity_label,
+                "is_stub":          bool(assessment.is_stub),
+                "ai_summary":       assessment.ai_summary,
+            } if assessment else None,
+        })
+    return result
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 1:1 ПОМОЩНИК
+# ══════════════════════════════════════════════════════════════════════════════
+
+@router.post("/developers/{developer_id}/one-on-one", response_model=OneOnOneMeetingOut)
+async def generate_one_on_one(
+    developer_id: int,
+    db: AsyncSession = Depends(get_db),
+):
+    """Сгенерировать вопросы для 1:1 встречи на основе risk score разработчика."""
+    dev = await db.get(Developer, developer_id)
+    if not dev:
+        raise HTTPException(404, "Developer not found")
+
+    latest = await _get_latest_score(db, developer_id)
+    if not latest:
+        raise HTTPException(400, "Нет данных о производительности. Запустите синхронизацию.")
+
+    from app.services.gigachat import get_gigachat
+    svc = get_gigachat()
+    topics = await svc.generate_one_on_one_topics(
+        developer_name          = dev.display_name,
+        burnout_risk_score      = latest.burnout_risk_score,
+        burnout_risk_level      = latest.burnout_risk_level,
+        velocity_trend          = latest.velocity_trend,
+        overall_score           = latest.overall_score,
+        delivery_score          = latest.delivery_score,
+        quality_score           = latest.quality_score,
+        collaboration_score     = latest.collaboration_score,
+        consistency_score       = latest.consistency_score,
+        after_hours_ratio       = latest.after_hours_ratio,
+        weekend_activity_ratio  = latest.weekend_activity_ratio,
+    )
+
+    meeting = OneOnOneMeeting(
+        developer_id = developer_id,
+        risk_level   = latest.burnout_risk_level,
+        risk_score   = latest.burnout_risk_score,
+        questions    = [{"topic": t.topic, "advice": t.advice, "category": t.category, "urgency": t.urgency}
+                        for t in topics],
+    )
+    db.add(meeting)
+    await db.commit()
+    await db.refresh(meeting)
+    return _meeting_to_out(meeting)
+
+
+@router.get("/developers/{developer_id}/one-on-one", response_model=list[OneOnOneMeetingOut])
+async def list_one_on_one(
+    developer_id: int,
+    limit: int = Query(default=10, ge=1, le=50),
+    db: AsyncSession = Depends(get_db),
+):
+    """История 1:1 встреч разработчика."""
+    meetings = (await db.execute(
+        select(OneOnOneMeeting)
+        .where(OneOnOneMeeting.developer_id == developer_id)
+        .order_by(OneOnOneMeeting.created_at.desc())
+        .limit(limit)
+    )).scalars().all()
+    return [_meeting_to_out(m) for m in meetings]
+
+
+@router.patch("/developers/{developer_id}/one-on-one/{meeting_id}", response_model=OneOnOneMeetingOut)
+async def update_one_on_one_notes(
+    developer_id: int,
+    meeting_id:   int,
+    notes: str = Body(...),
+    db: AsyncSession = Depends(get_db),
+):
+    """Сохранить заметки после 1:1 встречи."""
+    meeting = await db.get(OneOnOneMeeting, meeting_id)
+    if not meeting or meeting.developer_id != developer_id:
+        raise HTTPException(404, "Meeting not found")
+    meeting.notes = notes
+    await db.commit()
+    await db.refresh(meeting)
+    return _meeting_to_out(meeting)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -844,6 +1140,8 @@ async def _rebuild_developer_metrics(db, dev, since):
         DailyMetric.developer_id == dev.id, DailyMetric.date >= since))
     await db.execute(delete(PerformanceScore).where(
         PerformanceScore.developer_id == dev.id, PerformanceScore.week_start >= since))
+    await db.execute(delete(BiWeeklyScore).where(
+        BiWeeklyScore.developer_id == dev.id))
     await db.flush()
 
     events = []
@@ -936,25 +1234,219 @@ async def _rebuild_developer_metrics(db, dev, since):
     await db.flush()
 
     all_ts = [e.occurred_at for e in events]
-    now    = datetime.now(tz=timezone.utc)
-    week   = since.replace(hour=0, minute=0, second=0, microsecond=0)
+
+    # Предвычисляем данные для новых метрик один раз
+    # PR response times: часов от открытия PR до первого ревью
+    pr_review_map: dict[int, datetime] = {}
+    all_reviews = (await db.execute(
+        select(GitHubReview)
+        .join(GitHubPullRequest, GitHubReview.pr_id == GitHubPullRequest.id)
+        .where(GitHubPullRequest.author_login == dev.github_login)
+        if dev.github_login else select(GitHubReview).where(False)
+    )).scalars().all() if dev.github_login else []
+    for rv in all_reviews:
+        if rv.pr_id not in pr_review_map or rv.submitted_at < pr_review_map[rv.pr_id]:
+            pr_review_map[rv.pr_id] = rv.submitted_at
+
+    all_prs_map = {}
+    if dev.github_login:
+        for pr in (await db.execute(
+            select(GitHubPullRequest).where(
+                GitHubPullRequest.author_login == dev.github_login,
+                GitHubPullRequest.created_at >= since,
+            )
+        )).scalars().all():
+            all_prs_map[pr.id] = pr
+
+    # Комментарии разработчика в ревью (для engagement)
+    all_review_bodies = [
+        rv.body or "" for rv in (await db.execute(
+            select(GitHubReview).where(
+                GitHubReview.reviewer_login == dev.github_login,
+                GitHubReview.submitted_at >= since,
+            )
+        )).scalars().all()
+    ] if dev.github_login else []
+
+    now  = datetime.now(tz=timezone.utc)
+    week = since.replace(hour=0, minute=0, second=0, microsecond=0)
     while week <= now:
         week_end = week + timedelta(days=7)
+
         wm = [{c.name: getattr(r, c.name) for c in r.__table__.columns}
               for r in (await db.execute(select(DailyMetric).where(
                   DailyMetric.developer_id == dev.id,
                   DailyMetric.date >= week, DailyMetric.date < week_end,
               ))).scalars().all()]
-        pm = [{c.name: getattr(r, c.name) for c in r.__table__.columns}
-              for r in (await db.execute(select(DailyMetric).where(
-                  DailyMetric.developer_id == dev.id,
-                  DailyMetric.date >= week - timedelta(days=7), DailyMetric.date < week,
-              ))).scalars().all()]
+
+        # Последние 4 недели как baseline
+        prev_weeks: list[list[dict]] = []
+        for offset in range(1, 5):
+            pw_start = week - timedelta(days=7 * offset)
+            pw_end   = pw_start + timedelta(days=7)
+            pw_rows  = [{c.name: getattr(r, c.name) for c in r.__table__.columns}
+                        for r in (await db.execute(select(DailyMetric).where(
+                            DailyMetric.developer_id == dev.id,
+                            DailyMetric.date >= pw_start, DailyMetric.date < pw_end,
+                        ))).scalars().all()]
+            if pw_rows:
+                prev_weeks.append(pw_rows)
+
         wts = [t for t in all_ts if week <= t < week_end]
+
+        # PR response times для этой недели (часов)
+        week_pr_response: list[float] = []
+        week_pr_rework = week_pr_total = 0
+        for pr in all_prs_map.values():
+            pr_created = _dt(pr.created_at)
+            if not (week <= pr_created < week_end):
+                continue
+            week_pr_total += 1
+            if pr.id in pr_review_map:
+                hours = (pr_review_map[pr.id] - pr_created).total_seconds() / 3600
+                if hours >= 0:
+                    week_pr_response.append(hours)
+        # Считаем CHANGES_REQUESTED на PR этого разработчика за неделю
+        if dev.github_login:
+            rework_rows = (await db.execute(
+                select(GitHubReview)
+                .join(GitHubPullRequest, GitHubReview.pr_id == GitHubPullRequest.id)
+                .where(
+                    GitHubPullRequest.author_login == dev.github_login,
+                    GitHubReview.state == "CHANGES_REQUESTED",
+                    GitHubReview.submitted_at >= week,
+                    GitHubReview.submitted_at < week_end,
+                )
+            )).scalars().all()
+            week_pr_rework = len(rework_rows)
+
+        # Длины комментариев за неделю
+        week_comment_lengths = [
+            len(b) for rv in all_reviews
+            if week <= _dt(rv.submitted_at) < week_end
+            for b in [rv.body or ""] if b
+        ]
+
+        # Сложности задач (story points) за неделю
+        week_complexities: list[float] = []
+        if dev.jira_account_id:
+            jira_week = (await db.execute(
+                select(JiraIssue).where(
+                    JiraIssue.assignee_account_id == dev.jira_account_id,
+                    JiraIssue.resolved_at >= week,
+                    JiraIssue.resolved_at < week_end,
+                )
+            )).scalars().all()
+            week_complexities = [float(i.story_points) for i in jira_week if i.story_points]
+
         if wm:
-            db.add(PerformanceScore(**compute_performance_score(dev.id, week, wm, pm, wts)))
+            _ps_cols = {c.name for c in PerformanceScore.__table__.columns}
+            _ps_data = {k: v for k, v in compute_performance_score(
+                developer_id       = dev.id,
+                week_start         = week,
+                daily_metrics      = wm,
+                prev_weeks_metrics = prev_weeks,
+                activity_timestamps = wts,
+                pr_response_times  = week_pr_response,
+                comment_lengths    = week_comment_lengths,
+                task_complexities  = week_complexities,
+                pr_rework_count    = week_pr_rework,
+                pr_total           = week_pr_total,
+                vacation_periods   = [],
+            ).items() if k in _ps_cols}
+
+            # Подмешиваем GigaChat-оценки PR за эту неделю в quality_score
+            if dev.github_login:
+                gc_assessments = (await db.execute(
+                    select(PRGigaChatAssessment)
+                    .join(GitHubPullRequest, PRGigaChatAssessment.pr_id == GitHubPullRequest.id)
+                    .where(
+                        GitHubPullRequest.author_login == dev.github_login,
+                        GitHubPullRequest.created_at >= week,
+                        GitHubPullRequest.created_at < week_end,
+                        PRGigaChatAssessment.is_stub == 0,
+                    )
+                )).scalars().all()
+                if gc_assessments:
+                    avg_gc_quality = sum(a.quality_score for a in gc_assessments) / len(gc_assessments)
+                    code_health = _ps_data.get("quality_score", 100.0)
+                    # 50% code_health (структурное качество) + 50% GigaChat (смысловое качество)
+                    _ps_data["quality_score"] = round(code_health * 0.5 + avg_gc_quality * 0.5, 2)
+
+            db.add(PerformanceScore(**_ps_data))
         week = week_end
     await db.flush()
+
+    # Пересчитываем двухнедельные агрегаты
+    await _rebuild_biweekly_scores(db, dev.id)
+    await db.flush()
+
+
+# ── Двухнедельные агрегаты ─────────────────────────────────────────────────────
+
+_BIWEEKLY_EPOCH = datetime(2024, 1, 1, tzinfo=timezone.utc)  # понедельник
+
+
+def _biweekly_period_start(dt: datetime) -> datetime:
+    """Возвращает начало двухнедельного периода для даты dt."""
+    days = int((dt - _BIWEEKLY_EPOCH).total_seconds() // 86400)
+    period_num = days // 14
+    return _BIWEEKLY_EPOCH + timedelta(days=period_num * 14)
+
+
+async def _rebuild_biweekly_scores(db, developer_id: int) -> None:
+    """Агрегирует все weekly PerformanceScore в двухнедельные периоды."""
+    weekly_scores = (await db.execute(
+        select(PerformanceScore)
+        .where(PerformanceScore.developer_id == developer_id)
+        .order_by(PerformanceScore.week_start)
+    )).scalars().all()
+
+    if not weekly_scores:
+        return
+
+    # Группируем по двухнедельным периодам
+    from collections import defaultdict
+    buckets: dict[datetime, list[PerformanceScore]] = defaultdict(list)
+    for ws in weekly_scores:
+        ps = _biweekly_period_start(ws.week_start)
+        buckets[ps].append(ws)
+
+    def _avg(rows, field):
+        vals = [getattr(r, field) for r in rows if getattr(r, field) is not None]
+        return round(sum(vals) / len(vals), 2) if vals else 0.0
+
+    def _dominant_risk(rows):
+        priority = {"high": 2, "medium": 1, "low": 0}
+        return max((r.burnout_risk_level for r in rows), key=lambda x: priority.get(x, 0))
+
+    sorted_periods = sorted(buckets.keys())
+    prev_overall: Optional[float] = None
+
+    for period_start in sorted_periods:
+        rows = buckets[period_start]
+        period_end = period_start + timedelta(days=14)
+        overall = _avg(rows, "overall_score")
+        delta = round(overall - prev_overall, 2) if prev_overall is not None else None
+
+        db.add(BiWeeklyScore(
+            developer_id           = developer_id,
+            period_start           = period_start,
+            period_end             = period_end,
+            delivery_score         = _avg(rows, "delivery_score"),
+            quality_score          = _avg(rows, "quality_score"),
+            collaboration_score    = _avg(rows, "collaboration_score"),
+            consistency_score      = _avg(rows, "consistency_score"),
+            velocity_trend         = _avg(rows, "velocity_trend"),
+            overall_score          = overall,
+            burnout_risk_score     = _avg(rows, "burnout_risk_score"),
+            burnout_risk_level     = _dominant_risk(rows),
+            after_hours_ratio      = _avg(rows, "after_hours_ratio"),
+            weekend_activity_ratio = _avg(rows, "weekend_activity_ratio"),
+            weeks_included         = len(rows),
+            delta_overall          = delta,
+        ))
+        prev_overall = overall
 
 
 def _dt(val) -> datetime:
@@ -976,6 +1468,33 @@ def _jira_url(key: str) -> Optional[str]:
     if settings.JIRA_BASE_URL:
         return f"{settings.JIRA_BASE_URL}/browse/{key}"
     return None
+
+
+def _assessment_to_out(a: PRGigaChatAssessment) -> PRAssessmentOut:
+    return PRAssessmentOut(
+        pr_id             = a.pr_id,
+        quality_score     = a.quality_score,
+        complexity_score  = a.complexity_score,
+        quality_label     = a.quality_label,
+        complexity_label  = a.complexity_label,
+        quality_reasons   = a.quality_reasons or [],
+        complexity_reasons = a.complexity_reasons or [],
+        is_stub           = bool(a.is_stub),
+        ai_summary        = a.ai_summary,
+        assessed_at       = a.assessed_at,
+    )
+
+
+def _meeting_to_out(m: OneOnOneMeeting) -> OneOnOneMeetingOut:
+    return OneOnOneMeetingOut(
+        id           = m.id,
+        developer_id = m.developer_id,
+        created_at   = m.created_at,
+        risk_level   = m.risk_level,
+        risk_score   = m.risk_score,
+        questions    = [OneOnOneTopic(**q) for q in (m.questions or [])],
+        notes        = m.notes,
+    )
 
 
 # ══════════════════════════════════════════════════════════════════════════════

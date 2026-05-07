@@ -11,11 +11,13 @@ import DevelopersView  from './views/DevelopersView'
 import DeveloperDetail from './views/DeveloperDetail'
 import LeaderboardView from './views/LeaderboardView'
 import TeamReportView  from './views/TeamReport'
+import AboutView       from './views/AboutView'
 
 const NAV = [
   { id: 'teams',       label: 'Команды',       icon: '◈' },
   { id: 'developers',  label: 'Разработчики',  icon: '◎' },
-  { id: 'leaderboard', label: 'Рейтинг',       icon: '◆' },
+  { id: 'leaderboard', label: 'Аналитика',      icon: '◆' },
+  { id: 'about',       label: 'О системе',      icon: '○' },
 ]
 
 export default function App() {
@@ -27,14 +29,18 @@ export default function App() {
   const [developers,     setDevelopers]    = useState([])
   const [loading,        setLoading]       = useState(true)
 
-  const [deptModal, setDeptModal] = useState(null)   // null | 'new' | dept object
+  const [deptModal, setDeptModal] = useState(null)
   const [teamModal, setTeamModal] = useState(null)
   const [devModal,  setDevModal]  = useState(null)
   const [syncModal, setSyncModal] = useState(null)
 
   const loadData = useCallback(async () => {
     try {
-      const [d, t, devs] = await Promise.all([api.get('/departments'), api.get('/teams'), api.get('/developers')])
+      const [d, t, devs] = await Promise.all([
+        api.get('/departments'),
+        api.get('/teams'),
+        api.get('/developers'),
+      ])
       setDepartments(d); setTeams(t); setDevelopers(devs)
     } catch (e) { console.error(e) }
     setLoading(false)
@@ -61,11 +67,10 @@ export default function App() {
     if (selectedDevId === dev.id) { setSelectedDevId(null); setView('developers') }
     loadData()
   }
+
   const handleSelectDev  = id  => { setSelectedDevId(id);  setView('developer') }
   const handleViewReport = id  => { setSelectedTeamId(id); setView('teamreport') }
-  const navigate = id => { setView(id); setSelectedDevId(null); setSelectedTeamId(null) }
-
-  const deptsWithTeams = departments
+  const navigate         = id  => { setView(id); setSelectedDevId(null); setSelectedTeamId(null) }
 
   return (
     <div style={{ minHeight: '100vh', background: T.bg, color: T.text, fontFamily: fontSans, fontSize: 14 }}>
@@ -86,7 +91,8 @@ export default function App() {
           {NAV.map(({ id, label, icon }) => {
             const active = view === id
             return (
-              <button key={id} onClick={() => navigate(id)} style={{ display: 'flex', alignItems: 'center', gap: 10, width: '100%', padding: '9px 12px', borderRadius: 8, border: 'none', cursor: 'pointer', textAlign: 'left', marginBottom: 2, background: active ? T.accentDim : 'transparent', color: active ? T.accentLt : T.textMd, fontSize: 13, fontWeight: active ? 600 : 400, fontFamily: fontSans }}>
+              <button key={id} onClick={() => navigate(id)}
+                style={{ display: 'flex', alignItems: 'center', gap: 10, width: '100%', padding: '9px 12px', borderRadius: 8, border: 'none', cursor: 'pointer', textAlign: 'left', marginBottom: 2, background: active ? T.accentDim : 'transparent', color: active ? T.accentLt : T.textMd, fontSize: 13, fontWeight: active ? 600 : 400, fontFamily: fontSans }}>
                 <span style={{ fontFamily: font, fontSize: 13 }}>{icon}</span>{label}
               </button>
             )
@@ -99,7 +105,8 @@ export default function App() {
               {teams.map(team => {
                 const active = view === 'teamreport' && selectedTeamId === team.id
                 return (
-                  <button key={team.id} onClick={() => handleViewReport(team.id)} style={{ display: 'flex', alignItems: 'center', gap: 8, width: '100%', padding: '7px 12px', borderRadius: 8, border: 'none', cursor: 'pointer', textAlign: 'left', marginBottom: 1, background: active ? T.accentDim : 'transparent', color: active ? T.accentLt : T.textSm, fontSize: 12, fontFamily: fontSans }}>
+                  <button key={team.id} onClick={() => handleViewReport(team.id)}
+                    style={{ display: 'flex', alignItems: 'center', gap: 8, width: '100%', padding: '7px 12px', borderRadius: 8, border: 'none', cursor: 'pointer', textAlign: 'left', marginBottom: 1, background: active ? T.accentDim : 'transparent', color: active ? T.accentLt : T.textSm, fontSize: 12, fontFamily: fontSans }}>
                     <span style={{ fontFamily: font, fontSize: 11 }}>◈</span>
                     <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1 }}>{team.name}</span>
                   </button>
@@ -115,7 +122,8 @@ export default function App() {
               {developers.map(dev => {
                 const active = selectedDevId === dev.id && view === 'developer'
                 return (
-                  <button key={dev.id} onClick={() => handleSelectDev(dev.id)} style={{ display: 'flex', alignItems: 'center', gap: 8, width: '100%', padding: '7px 12px', borderRadius: 8, border: 'none', cursor: 'pointer', textAlign: 'left', marginBottom: 1, background: active ? T.accentDim : 'transparent', color: active ? T.accentLt : T.textSm, fontSize: 12, fontFamily: fontSans }}>
+                  <button key={dev.id} onClick={() => handleSelectDev(dev.id)}
+                    style={{ display: 'flex', alignItems: 'center', gap: 8, width: '100%', padding: '7px 12px', borderRadius: 8, border: 'none', cursor: 'pointer', textAlign: 'left', marginBottom: 1, background: active ? T.accentDim : 'transparent', color: active ? T.accentLt : T.textSm, fontSize: 12, fontFamily: fontSans }}>
                     <div style={{ width: 18, height: 18, borderRadius: '50%', flexShrink: 0, background: 'linear-gradient(135deg,#2563eb88,#8b5cf688)', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 8, fontWeight: 700, color: '#fff' }}>
                       {dev.display_name.charAt(0)}
                     </div>
@@ -170,6 +178,7 @@ export default function App() {
                 devId={selectedDevId} developers={developers} teams={teams}
                 onEdit={dev => setDevModal({ dev, defaultTeamId: dev.team_id })}
                 onSync={dev => setSyncModal(dev)}
+                onRefreshDev={loadData}
               />
             )}
             {view === 'teamreport' && selectedTeamId && (
@@ -179,8 +188,12 @@ export default function App() {
               />
             )}
             {view === 'leaderboard' && (
-              <LeaderboardView teams={teams} departments={departments} />
+              <LeaderboardView
+                teams={teams}
+                onSelectDev={handleSelectDev}
+              />
             )}
+            {view === 'about' && <AboutView />}
           </>
         )}
       </main>

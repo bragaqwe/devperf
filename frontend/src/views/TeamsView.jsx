@@ -19,7 +19,7 @@ export default function TeamsView({ departments, teams, devsByTeam, onEditTeam, 
             <div style={{ fontSize: 15, fontWeight: 700, color: T.text, fontFamily: fontSans }}>{team.name}</div>
             <div style={{ display: 'flex', gap: 6, marginTop: 4, flexWrap: 'wrap' }}>
               {team.jira_project_key && <Badge label={`Jira: ${team.jira_project_key}`} color={T.cyan} />}
-              {team.github_org       && <Badge label={`GH: ${team.github_org}`}          color={T.purple} />}
+              {team.github_org       && <Badge label={`GitHub: ${team.github_org}`}       color={T.purple} />}
               <Badge label={`${members.length} уч.`} color={T.textSm} />
             </div>
           </div>

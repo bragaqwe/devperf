@@ -44,7 +44,7 @@ export default function SyncModal({ developer, onClose }) {
         <>
           <div style={{ marginBottom: 14 }}>
             <label style={{ display: 'block', fontSize: 11, color: T.textSm, marginBottom: 5, fontFamily: font, textTransform: 'uppercase', letterSpacing: '0.06em' }}>GitHub репозитории (по одному в строку)</label>
-            <textarea value={repos} onChange={e => setRepos(e.target.value)} placeholder={'owner/repo\nowner/another'} rows={3}
+            <textarea value={repos} onChange={e => setRepos(e.target.value)} placeholder={'владелец/репозиторий\nвладелец/другой-репозиторий'} rows={3}
               style={{ width: '100%', padding: '9px 12px', borderRadius: 8, border: `1px solid ${T.border}`, background: T.surface, color: T.text, fontSize: 12, fontFamily: font, resize: 'vertical', outline: 'none', boxSizing: 'border-box' }}
               onFocus={e => e.target.style.borderColor = T.accentLt}
               onBlur={e  => e.target.style.borderColor = T.border} />

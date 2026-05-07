@@ -27,8 +27,8 @@ export default function TeamModal({ team, departments, onClose, onSave }) {
     <Modal title={team ? 'Редактировать команду' : 'Новая команда'} onClose={onClose}>
       <Input label="Название *" value={name} onChange={setName} placeholder="Core Platform" />
       <Select label="Департамент" value={deptId} onChange={setDeptId} options={deptOptions} />
-      <Input label="Jira Project Key" value={jiraKey} onChange={setJiraKey} placeholder="SCRUM" hint="Префикс перед номером задачи — SCRUM-123 → SCRUM" />
-      <Input label="GitHub Organization" value={ghOrg} onChange={setGhOrg} placeholder="my-org" hint="Автоматически находит репозитории при синхронизации" />
+      <Input label="Ключ Jira-проекта" value={jiraKey} onChange={setJiraKey} placeholder="SCRUM" hint="Префикс перед номером задачи — SCRUM-123 → SCRUM" />
+      <Input label="GitHub организация" value={ghOrg} onChange={setGhOrg} placeholder="my-org" hint="Автоматически находит репозитории при синхронизации" />
       {error && <div style={{ color: T.red, fontSize: 12, marginBottom: 12 }}>{error}</div>}
       <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
         <Btn onClick={onClose}>Отмена</Btn>

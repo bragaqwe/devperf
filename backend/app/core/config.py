@@ -14,6 +14,7 @@ class Settings(BaseSettings):
     JIRA_BASE_URL: Optional[str] = None
     JIRA_EMAIL: Optional[str] = None
     JIRA_API_TOKEN: Optional[str] = None
+    GIGACHAT_AUTH_KEY: Optional[str] = None
 
     WEIGHT_DELIVERY:      float = 0.35
     WEIGHT_QUALITY:       float = 0.30

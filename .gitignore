@@ -97,3 +97,6 @@ docker-compose.override.yml
 # Temporary files
 tmp/
 temp/
+
+.claude/worktrees/
+
