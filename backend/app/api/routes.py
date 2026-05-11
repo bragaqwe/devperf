@@ -22,6 +22,7 @@ from app.models.schemas import (
     DayActivityReport, TimelineEvent,
     TeamReport, MemberSnapshot, TeamWeeklyPoint,
     PRAssessmentOut, OneOnOneMeetingOut, OneOnOneTopic,
+    CapacityAnalysisOut, SprintScenarioOut,
 )
 
 router = APIRouter()
@@ -536,6 +537,114 @@ async def get_biweekly_scores(
                BiWeeklyScore.period_start >= since)
         .order_by(BiWeeklyScore.period_start)
     )).scalars().all()
+
+
+@router.get("/developers/{developer_id}/capacity-analysis", response_model=CapacityAnalysisOut)
+async def get_capacity_analysis(
+    developer_id: int,
+    weeks: int = Query(default=16, ge=4, le=52, description="Сколько недель истории брать"),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Анализ нагрузки разработчика: текущий уровень, устойчивый потолок, headroom.
+    Отвечает на вопрос: «Справится ли разработчик с бОльшей нагрузкой в следующем спринте?»
+    """
+    from app.services.capacity import WeekLoad, analyze_capacity
+
+    dev = await db.get(Developer, developer_id)
+    if not dev:
+        raise HTTPException(404, "Developer not found")
+
+    since = datetime.now(tz=timezone.utc) - timedelta(weeks=weeks)
+
+    # Грузим все PerformanceScore за период
+    scores = (await db.execute(
+        select(PerformanceScore)
+        .where(PerformanceScore.developer_id == developer_id,
+               PerformanceScore.week_start >= since)
+        .order_by(PerformanceScore.week_start)
+    )).scalars().all()
+
+    if not scores:
+        raise HTTPException(404, "Недостаточно данных. Запустите синхронизацию.")
+
+    week_loads: list[WeekLoad] = []
+
+    for score in scores:
+        week_end = score.week_start + timedelta(days=7)
+
+        # DailyMetric за эту неделю
+        daily_rows = (await db.execute(
+            select(DailyMetric)
+            .where(DailyMetric.developer_id == developer_id,
+                   DailyMetric.date >= score.week_start,
+                   DailyMetric.date < week_end)
+        )).scalars().all()
+
+        # Нагрузка будет рассчитана адаптивно внутри analyze_capacity (z-score)
+        week_loads.append(WeekLoad(
+            week_start   = score.week_start.isoformat(),
+            commits      = sum(d.commits_count          for d in daily_rows),
+            prs          = sum(d.prs_opened             for d in daily_rows),
+            reviews      = sum(d.reviews_given          for d in daily_rows),
+            story_points = sum(d.story_points_delivered for d in daily_rows),
+            lines_added  = sum(d.lines_added            for d in daily_rows),
+            quality      = score.quality_score,
+            burnout      = score.burnout_risk_score,
+            after_hours  = score.after_hours_ratio or 0.0,
+            weekend      = score.weekend_activity_ratio or 0.0,
+        ))
+
+    # ── Открытые задачи Jira (WIP) ───────────────────────────────────────────
+    DONE_STATUSES = {"done", "closed", "resolved", "завершено", "закрыто", "выполнено"}
+    wip_task_count = 0
+    wip_sp         = 0.0
+    if dev.jira_account_id:
+        open_issues = (await db.execute(
+            select(JiraIssue)
+            .where(JiraIssue.assignee_account_id == dev.jira_account_id,
+                   JiraIssue.resolved_at.is_(None))
+        )).scalars().all()
+        # Дополнительно фильтруем по статусу — на случай если resolved_at не выставлен
+        open_issues = [i for i in open_issues if i.status.lower() not in DONE_STATUSES]
+        wip_task_count = len(open_issues)
+        wip_sp         = sum(i.story_points or 0.0 for i in open_issues)
+
+    result = analyze_capacity(week_loads, wip_task_count=wip_task_count, wip_sp=wip_sp)
+    if result is None:
+        raise HTTPException(422, "Недостаточно данных для анализа (нужно минимум 4 недели).")
+
+    return CapacityAnalysisOut(
+        current_load_pct        = result.current_load_pct,
+        current_load_level      = result.current_load_level,
+        efficiency_index        = result.efficiency_index,
+        efficiency_level        = result.efficiency_level,
+        efficiency_delta        = result.efficiency_delta,
+        peak_sustainable_pct    = result.peak_sustainable_pct,
+        headroom_pct            = result.headroom_pct,
+        can_take_more           = result.can_take_more,
+        quality_sensitivity     = result.quality_sensitivity,
+        high_load_quality_avg   = result.high_load_quality_avg,
+        normal_load_quality_avg = result.normal_load_quality_avg,
+        already_overworked      = result.already_overworked,
+        wip_task_count          = result.wip.task_count,
+        wip_sp                  = result.wip.total_sp,
+        wip_avg_weekly_sp       = result.wip.avg_weekly_sp,
+        wip_overloaded          = result.wip.overloaded,
+        sprint_scenarios        = [
+            SprintScenarioOut(
+                label             = s.label,
+                load_pct          = s.load_pct,
+                predicted_quality = s.predicted_quality,
+                risk              = s.risk,
+            ) for s in result.sprint_scenarios
+        ],
+        recommendation          = result.recommendation,
+        confidence              = result.confidence,
+        weeks_analyzed          = result.weeks_analyzed,
+        weekly                  = result.weekly,
+        top_load_drivers        = result.top_load_drivers,
+    )
 
 
 @router.get("/developers/{developer_id}/daily-metrics", response_model=list[DailyMetricOut])
@@ -1377,9 +1486,64 @@ async def _rebuild_developer_metrics(db, dev, since):
         week = week_end
     await db.flush()
 
-    # Пересчитываем двухнедельные агрегаты
+    # Anomaly detection на сырых DailyMetric по всей истории разработчика
+    await _detect_weekly_anomalies(db, dev.id)
+    await db.flush()
+
+    # Пересчитываем двухнедельные агрегаты (после anomaly detection)
     await _rebuild_biweekly_scores(db, dev.id)
     await db.flush()
+
+
+# ── Anomaly detection (Isolation Forest на сырых DailyMetric) ─────────────────
+
+async def _detect_weekly_anomalies(db, developer_id: int) -> None:
+    """
+    Для каждой недели в PerformanceScore агрегирует сырые DailyMetric,
+    прогоняет через Isolation Forest и обновляет поля week_is_anomaly,
+    week_anomaly_score, week_anomaly_features.
+    """
+    from app.services.anomaly import build_weekly_features, detect_weekly_anomalies
+
+    # Все недельные записи разработчика
+    perf_scores = (await db.execute(
+        select(PerformanceScore)
+        .where(PerformanceScore.developer_id == developer_id)
+        .order_by(PerformanceScore.week_start)
+    )).scalars().all()
+
+    if not perf_scores:
+        return
+
+    # Для каждой недели загружаем DailyMetric и строим вектор признаков
+    weeks_data: list[dict] = []
+    for ps in perf_scores:
+        week_end = ps.week_start + timedelta(days=7)
+        daily_rows = (await db.execute(
+            select(DailyMetric).where(
+                DailyMetric.developer_id == developer_id,
+                DailyMetric.date >= ps.week_start,
+                DailyMetric.date < week_end,
+            )
+        )).scalars().all()
+
+        daily_dicts = [{c.name: getattr(r, c.name) for c in r.__table__.columns}
+                       for r in daily_rows]
+        features = build_weekly_features(daily_dicts)
+        weeks_data.append({"_ps_id": ps.id, **features})
+
+    # Isolation Forest по всей истории
+    result = detect_weekly_anomalies(weeks_data)
+
+    # Обновляем PerformanceScore записи
+    ps_by_id = {ps.id: ps for ps in perf_scores}
+    for r in result:
+        ps = ps_by_id.get(r["_ps_id"])
+        if ps:
+            ps.week_anomaly_score    = r["week_anomaly_score"]
+            ps.week_is_anomaly       = r["week_is_anomaly"]
+            ps.week_anomaly_features = r["week_anomaly_features"]
+            db.add(ps)
 
 
 # ── Двухнедельные агрегаты ─────────────────────────────────────────────────────
@@ -1395,7 +1559,13 @@ def _biweekly_period_start(dt: datetime) -> datetime:
 
 
 async def _rebuild_biweekly_scores(db, developer_id: int) -> None:
-    """Агрегирует все weekly PerformanceScore в двухнедельные периоды."""
+    """
+    Агрегирует weekly PerformanceScore в двухнедельные периоды.
+    Аномальность периода определяется по week_is_anomaly недель внутри него
+    (уже проставлено _detect_weekly_anomalies).
+    """
+    from collections import defaultdict
+
     weekly_scores = (await db.execute(
         select(PerformanceScore)
         .where(PerformanceScore.developer_id == developer_id)
@@ -1406,8 +1576,7 @@ async def _rebuild_biweekly_scores(db, developer_id: int) -> None:
         return
 
     # Группируем по двухнедельным периодам
-    from collections import defaultdict
-    buckets: dict[datetime, list[PerformanceScore]] = defaultdict(list)
+    buckets: dict[datetime, list] = defaultdict(list)
     for ws in weekly_scores:
         ps = _biweekly_period_start(ws.week_start)
         buckets[ps].append(ws)
@@ -1420,33 +1589,85 @@ async def _rebuild_biweekly_scores(db, developer_id: int) -> None:
         priority = {"high": 2, "medium": 1, "low": 0}
         return max((r.burnout_risk_level for r in rows), key=lambda x: priority.get(x, 0))
 
+    def _intra_delta(rows, field):
+        """week2 − week1 внутри периода. None если только одна неделя."""
+        sorted_rows = sorted(rows, key=lambda r: r.week_start)
+        if len(sorted_rows) < 2:
+            return None
+        w1 = getattr(sorted_rows[0],  field) or 0.0
+        w2 = getattr(sorted_rows[-1], field) or 0.0
+        return round(w2 - w1, 2)
+
+    # Проход 1: строим список периодов с усреднёнными метриками
     sorted_periods = sorted(buckets.keys())
     prev_overall: Optional[float] = None
+    period_dicts: list[dict] = []
 
     for period_start in sorted_periods:
-        rows = buckets[period_start]
-        period_end = period_start + timedelta(days=14)
+        rows    = buckets[period_start]
         overall = _avg(rows, "overall_score")
-        delta = round(overall - prev_overall, 2) if prev_overall is not None else None
+        delta   = round(overall - prev_overall, 2) if prev_overall is not None else None
 
-        db.add(BiWeeklyScore(
-            developer_id           = developer_id,
-            period_start           = period_start,
-            period_end             = period_end,
-            delivery_score         = _avg(rows, "delivery_score"),
-            quality_score          = _avg(rows, "quality_score"),
-            collaboration_score    = _avg(rows, "collaboration_score"),
-            consistency_score      = _avg(rows, "consistency_score"),
-            velocity_trend         = _avg(rows, "velocity_trend"),
-            overall_score          = overall,
-            burnout_risk_score     = _avg(rows, "burnout_risk_score"),
-            burnout_risk_level     = _dominant_risk(rows),
-            after_hours_ratio      = _avg(rows, "after_hours_ratio"),
-            weekend_activity_ratio = _avg(rows, "weekend_activity_ratio"),
-            weeks_included         = len(rows),
-            delta_overall          = delta,
-        ))
+        # Аномалия периода: хотя бы одна из недель помечена детектором
+        period_is_anomaly = any(getattr(r, "week_is_anomaly", False) for r in rows)
+        # Берём максимальный anomaly_score среди недель периода
+        anomaly_scores = [getattr(r, "week_anomaly_score", None) for r in rows
+                          if getattr(r, "week_anomaly_score", None) is not None]
+        period_anomaly_score = round(max(anomaly_scores), 3) if anomaly_scores else None
+        # Фичи аномалии — из той недели что аномальнее
+        anomaly_week = max(rows, key=lambda r: getattr(r, "week_anomaly_score", 0) or 0)
+        period_anomaly_features = getattr(anomaly_week, "week_anomaly_features", []) or []
+
+        period_dicts.append({
+            "developer_id":           developer_id,
+            "period_start":           period_start,
+            "period_end":             period_start + timedelta(days=14),
+            "delivery_score":         _avg(rows, "delivery_score"),
+            "quality_score":          _avg(rows, "quality_score"),
+            "collaboration_score":    _avg(rows, "collaboration_score"),
+            "consistency_score":      _avg(rows, "consistency_score"),
+            "velocity_trend":         _avg(rows, "velocity_trend"),
+            "overall_score":          overall,
+            "burnout_risk_score":     _avg(rows, "burnout_risk_score"),
+            "burnout_risk_level":     _dominant_risk(rows),
+            "after_hours_ratio":      _avg(rows, "after_hours_ratio"),
+            "weekend_activity_ratio": _avg(rows, "weekend_activity_ratio"),
+            "weeks_included":         len(rows),
+            "delta_overall":          delta,
+            "intra_overall_delta":    _intra_delta(rows, "overall_score"),
+            "intra_burnout_delta":    _intra_delta(rows, "burnout_risk_score"),
+            "intra_delivery_delta":   _intra_delta(rows, "delivery_score"),
+            "is_anomaly":             period_is_anomaly,
+            "anomaly_score":          period_anomaly_score,
+            "anomaly_features":       period_anomaly_features,
+        })
         prev_overall = overall
+
+    # Записываем в БД — аномалия периода = хотя бы одна аномальная неделя внутри
+    for pd in period_dicts:
+        db.add(BiWeeklyScore(
+            developer_id           = pd["developer_id"],
+            period_start           = pd["period_start"],
+            period_end             = pd["period_end"],
+            delivery_score         = pd["delivery_score"],
+            quality_score          = pd["quality_score"],
+            collaboration_score    = pd["collaboration_score"],
+            consistency_score      = pd["consistency_score"],
+            velocity_trend         = pd["velocity_trend"],
+            overall_score          = pd["overall_score"],
+            burnout_risk_score     = pd["burnout_risk_score"],
+            burnout_risk_level     = pd["burnout_risk_level"],
+            after_hours_ratio      = pd["after_hours_ratio"],
+            weekend_activity_ratio = pd["weekend_activity_ratio"],
+            weeks_included         = pd["weeks_included"],
+            delta_overall          = pd["delta_overall"],
+            intra_overall_delta    = pd["intra_overall_delta"],
+            intra_burnout_delta    = pd["intra_burnout_delta"],
+            intra_delivery_delta   = pd["intra_delivery_delta"],
+            anomaly_score          = pd["anomaly_score"],
+            is_anomaly             = pd["is_anomaly"],
+            anomaly_features       = pd["anomaly_features"],
+        ))
 
 
 def _dt(val) -> datetime:

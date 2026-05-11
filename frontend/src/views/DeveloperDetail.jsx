@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import {
   LineChart, Line, BarChart, Bar, RadarChart, Radar,
   PolarGrid, PolarAngleAxis, ResponsiveContainer,
@@ -186,19 +186,136 @@ const SCORE_COLS = [
   { key: 'delivery_score',      label: 'Поставка',     color: T.green },
   { key: 'quality_score',       label: 'Качество',     color: T.purple },
   { key: 'collaboration_score', label: 'Коллаборация', color: T.amber },
-  { key: 'consistency_score',   label: 'Стабильность', color: T.cyan },
 ]
 
 function DeltaBadge({ value }) {
   if (value == null) return <span style={{ color: T.textSm, fontSize: 11, fontFamily: font }}>—</span>
   const up = value >= 0
   return (
-    <span style={{
-      fontSize: 11, fontFamily: font, fontWeight: 600,
-      color: up ? T.green : T.red,
-    }}>
+    <span style={{ fontSize: 11, fontFamily: font, fontWeight: 600, color: up ? T.green : T.red }}>
       {up ? '↑' : '↓'} {Math.abs(value).toFixed(1)}
     </span>
+  )
+}
+
+const DEVIATION_BAR_MAX = 3.5   // z-score при котором полоска = 100%
+
+function AnomalyBadge({ period }) {
+  const [open, setOpen] = useState(false)
+  const ref = useRef(null)
+
+  useEffect(() => {
+    if (!open) return
+    const handler = e => { if (ref.current && !ref.current.contains(e.target)) setOpen(false) }
+    document.addEventListener('mousedown', handler)
+    return () => document.removeEventListener('mousedown', handler)
+  }, [open])
+
+  if (!period.is_anomaly) return null
+
+  const score    = period.anomaly_score != null ? `${(period.anomaly_score * 100).toFixed(0)}%` : ''
+  const features = period.anomaly_features || []
+
+  return (
+    <div ref={ref} style={{ position: 'relative', display: 'inline-block' }}>
+      {/* Бейдж-триггер */}
+      <span
+        onClick={() => setOpen(v => !v)}
+        style={{
+          display: 'inline-flex', alignItems: 'center', gap: 4,
+          fontSize: 10, fontFamily: font, fontWeight: 700,
+          color: T.amber, background: `${T.amber}18`,
+          border: `1px solid ${T.amber}40`,
+          borderRadius: 4, padding: '2px 7px',
+          cursor: 'pointer', whiteSpace: 'nowrap',
+          userSelect: 'none',
+        }}
+      >
+        ⚠ аномалия {score}
+        <span style={{ fontSize: 8, opacity: 0.7 }}>{open ? '▲' : '▼'}</span>
+      </span>
+
+      {/* Выпадашка */}
+      {open && (
+        <div style={{
+          position: 'absolute', right: 0, top: 'calc(100% + 6px)', zIndex: 200,
+          width: 300,
+          background: T.surface,
+          border: `1px solid ${T.amber}50`,
+          borderRadius: 10,
+          boxShadow: '0 8px 32px rgba(0,0,0,0.35)',
+          padding: '14px 16px',
+        }}>
+          {/* Заголовок */}
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
+            <div style={{ fontSize: 12, fontWeight: 700, color: T.amber, fontFamily: fontSans }}>
+              ⚠ Аномальный период
+            </div>
+            <div style={{ fontSize: 11, color: T.textSm, fontFamily: font }}>
+              индекс {score}
+            </div>
+          </div>
+
+          {/* Описание */}
+          <div style={{ fontSize: 11, color: T.textMd, fontFamily: fontSans, lineHeight: 1.5, marginBottom: 12 }}>
+            Isolation Forest выявил этот период как статистически нетипичный
+            для данного разработчика. Ниже — показатели с наибольшим отклонением от его нормы.
+          </div>
+
+          {/* Фичи */}
+          {features.length > 0 ? (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+              {features.map((f, i) => {
+                const barW = Math.min(100, (f.deviation / DEVIATION_BAR_MAX) * 100)
+                const isHigh = f.direction === 'выше нормы'
+                const barColor = isHigh ? T.amber : T.red
+                return (
+                  <div key={i}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 4 }}>
+                      <span style={{ fontSize: 11, fontWeight: 600, color: T.text, fontFamily: fontSans }}>
+                        {f.label}
+                      </span>
+                      <span style={{ fontSize: 10, color: isHigh ? T.amber : T.red, fontFamily: font, fontWeight: 600 }}>
+                        {isHigh ? '↑' : '↓'} {f.direction}
+                      </span>
+                    </div>
+                    {/* Полоска отклонения */}
+                    <div style={{ height: 4, background: `${T.border}`, borderRadius: 2, overflow: 'hidden' }}>
+                      <div style={{
+                        height: '100%', width: `${barW}%`,
+                        background: barColor, borderRadius: 2,
+                        transition: 'width 0.3s ease',
+                      }} />
+                    </div>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: 3 }}>
+                      <span style={{ fontSize: 10, color: T.textSm, fontFamily: font }}>
+                        значение: <span style={{ color: T.text }}>{f.value}</span>
+                      </span>
+                      <span style={{ fontSize: 10, color: T.textSm, fontFamily: font }}>
+                        норма: <span style={{ color: T.text }}>{f.mean}</span>
+                        <span style={{ color: T.textSm }}> · z={f.deviation}</span>
+                      </span>
+                    </div>
+                  </div>
+                )
+              })}
+            </div>
+          ) : (
+            <div style={{ fontSize: 11, color: T.textSm, fontFamily: font }}>
+              Детализация недоступна
+            </div>
+          )}
+
+          {/* Подсказка */}
+          <div style={{
+            marginTop: 14, paddingTop: 10, borderTop: `1px solid ${T.border}`,
+            fontSize: 10, color: T.textSm, fontFamily: font, lineHeight: 1.5,
+          }}>
+            z — количество стандартных отклонений от среднего по истории разработчика
+          </div>
+        </div>
+      )}
+    </div>
   )
 }
 
@@ -225,7 +342,6 @@ function BiWeeklyHistory({ devId }) {
     Поставка:     +p.delivery_score.toFixed(1),
     Качество:     +p.quality_score.toFixed(1),
     Коллаборация: +p.collaboration_score.toFixed(1),
-    Стабильность: +p.consistency_score.toFixed(1),
   }))
 
   return (
@@ -263,7 +379,7 @@ function BiWeeklyHistory({ devId }) {
                 ))}
                 <th style={{ padding: '10px 12px', textAlign: 'right', color: T.textSm, fontFamily: font, fontSize: 11, fontWeight: 500 }}>Δ Общий</th>
                 <th style={{ padding: '10px 12px', textAlign: 'right', color: T.textSm, fontFamily: font, fontSize: 11, fontWeight: 500 }}>Выгорание</th>
-                <th style={{ padding: '10px 12px', textAlign: 'right', color: T.textSm, fontFamily: font, fontSize: 11, fontWeight: 500 }}>Нед.</th>
+                <th style={{ padding: '10px 12px', textAlign: 'right', color: T.amber, fontFamily: font, fontSize: 11, fontWeight: 500 }}>Аномалия</th>
               </tr>
             </thead>
             <tbody>
@@ -275,7 +391,9 @@ function BiWeeklyHistory({ devId }) {
                 return (
                   <tr key={p.id} style={{
                     borderBottom: `1px solid ${T.border}`,
-                    background: isFirst ? `${T.accentLt}08` : 'transparent',
+                    background: p.is_anomaly
+                      ? `${T.amber}0a`
+                      : isFirst ? `${T.accentLt}08` : 'transparent',
                   }}>
                     <td style={{ padding: '9px 14px', color: T.text, whiteSpace: 'nowrap', fontWeight: isFirst ? 600 : 400 }}>{label}</td>
                     {SCORE_COLS.map(c => (
@@ -291,7 +409,9 @@ function BiWeeklyHistory({ devId }) {
                         {burnoutLabel[p.burnout_risk_level] || p.burnout_risk_level}
                       </span>
                     </td>
-                    <td style={{ padding: '9px 12px', textAlign: 'right', color: T.textSm }}>{p.weeks_included}</td>
+                    <td style={{ padding: '9px 12px', textAlign: 'right' }}>
+                      <AnomalyBadge period={p} />
+                    </td>
                   </tr>
                 )
               })}
@@ -370,13 +490,6 @@ function OneOnOnePanel({ devId }) {
 
       {active && (
         <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
-          <div style={{ display: 'flex', gap: 8, alignItems: 'center', fontSize: 12, color: T.textSm, fontFamily: font }}>
-            <span>Risk score:</span>
-            <span style={{ fontWeight: 700, color: burnoutColor[active.risk_level] }}>
-              {(active.risk_score * 100).toFixed(0)}% — {burnoutLabel[active.risk_level] || active.risk_level}
-            </span>
-          </div>
-
           <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
             {active.questions.map((q, i) => (
               <div key={i} style={{
@@ -421,6 +534,342 @@ function OneOnOnePanel({ devId }) {
   )
 }
 
+// ── Анализ нагрузки ───────────────────────────────────────────────────────────
+
+const LOAD_LEVEL_META = {
+  low:      { label: 'Низкая',   color: T.green,    bg: `${T.green}18`    },
+  medium:   { label: 'Средняя',  color: T.accentLt, bg: `${T.accentLt}18` },
+  high:     { label: 'Высокая',  color: T.amber,    bg: `${T.amber}18`    },
+  overload: { label: 'Перегруз', color: T.red,      bg: `${T.red}18`      },
+}
+const EFF_LEVEL_META = {
+  low:    { label: 'Низкая',   color: T.red    },
+  medium: { label: 'Средняя',  color: T.amber  },
+  high:   { label: 'Высокая',  color: T.green  },
+}
+const RISK_COLOR = { low: T.green, medium: T.amber, high: T.red }
+const CONFIDENCE_LABEL = { low: 'низкая', medium: 'средняя', high: 'высокая' }
+
+function GaugeBar({ value, color, label, sublabel }) {
+  return (
+    <div>
+      <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 5 }}>
+        <span style={{ fontSize: 12, fontWeight: 600, color: T.text, fontFamily: fontSans }}>{label}</span>
+        <span style={{ fontSize: 12, fontWeight: 700, color, fontFamily: font }}>{value.toFixed(0)}%</span>
+      </div>
+      <div style={{ height: 8, borderRadius: 5, background: T.border, overflow: 'hidden' }}>
+        <div style={{ height: '100%', width: `${Math.min(100, Math.max(0, value))}%`, background: color, borderRadius: 5, transition: 'width 0.6s ease' }} />
+      </div>
+      {sublabel && <div style={{ fontSize: 10, color: T.textSm, fontFamily: font, marginTop: 3 }}>{sublabel}</div>}
+    </div>
+  )
+}
+
+function EfficiencyPanel({ devId }) {
+  const [data,    setData]    = useState(null)
+  const [loading, setLoading] = useState(true)
+  const [error,   setError]   = useState(null)
+
+  useEffect(() => {
+    setLoading(true); setError(null)
+    api.get(`/developers/${devId}/capacity-analysis?weeks=16`)
+      .then(d => { setData(d); setLoading(false) })
+      .catch(e => { setError(e?.message || 'Ошибка'); setLoading(false) })
+  }, [devId])
+
+  if (loading) return <div style={{ padding: 48, display: 'flex', justifyContent: 'center' }}><Spinner /></div>
+  if (error || !data) return <EmptyState icon="◎" text="Нет данных для анализа. Запустите синхронизацию." />
+
+  const lvl = LOAD_LEVEL_META[data.current_load_level] || LOAD_LEVEL_META.medium
+  const eff = EFF_LEVEL_META[data.efficiency_level]    || EFF_LEVEL_META.medium
+  const sensColor = data.quality_sensitivity < -0.3 ? T.red : data.quality_sensitivity > 0.3 ? T.green : T.textMd
+  const sensLabel = data.quality_sensitivity < -0.3 ? 'падает под нагрузкой' :
+                    data.quality_sensitivity >  0.3 ? 'растёт под нагрузкой' : 'стабильно'
+
+  const chartData = data.weekly.map(w => ({
+    week:         w.week.slice(5),
+    'Нагрузка %': w.load_pct,
+    'Качество':   w.quality,
+  }))
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+
+      {/* ── Строка 1: Индекс эффективности + Нагрузка + Резерв ── */}
+      <div style={{ display: 'grid', gridTemplateColumns: '1.1fr 1fr 1fr', gap: 14 }}>
+
+        {/* Индекс эффективности — главная карточка */}
+        <Card style={{ border: `1px solid ${eff.color}40` }}>
+          <div style={{ fontSize: 11, fontWeight: 700, color: T.textSm, fontFamily: font, textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: 12 }}>
+            Индекс эффективности
+          </div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 16, marginBottom: 16 }}>
+            <div style={{
+              width: 72, height: 72, borderRadius: '50%', flexShrink: 0,
+              background: `${eff.color}15`, border: `3px solid ${eff.color}`,
+              display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center',
+            }}>
+              <div style={{ fontSize: 22, fontWeight: 800, color: eff.color, fontFamily: font, lineHeight: 1 }}>
+                {data.efficiency_index.toFixed(0)}
+              </div>
+              <div style={{ fontSize: 9, color: eff.color, fontFamily: font }}>/ 100</div>
+            </div>
+            <div>
+              <div style={{
+                fontSize: 13, fontWeight: 700, color: eff.color, fontFamily: fontSans,
+                background: `${eff.color}14`, border: `1px solid ${eff.color}40`,
+                borderRadius: 6, padding: '3px 10px', display: 'inline-block', marginBottom: 6,
+              }}>{eff.label}</div>
+              <div style={{ fontSize: 11, color: T.textSm, fontFamily: font }}>
+                {data.efficiency_delta >= 0
+                  ? `↑ +${data.efficiency_delta.toFixed(1)} пт. выше нормы`
+                  : `↓ ${data.efficiency_delta.toFixed(1)} пт. ниже нормы`}
+              </div>
+            </div>
+          </div>
+          <div style={{ fontSize: 11, color: T.textSm, fontFamily: font, lineHeight: 1.5 }}>
+            Качество / нагрузка относительно личного baseline. 50 = работает строго по норме.
+          </div>
+        </Card>
+
+        {/* Нагрузка */}
+        <Card>
+          <div style={{ fontSize: 11, fontWeight: 700, color: T.textSm, fontFamily: font, textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: 12 }}>
+            Текущая нагрузка
+          </div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 14 }}>
+            <div style={{
+              width: 52, height: 52, borderRadius: '50%', flexShrink: 0,
+              background: lvl.bg, border: `2px solid ${lvl.color}`,
+              display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center',
+            }}>
+              <div style={{ fontSize: 16, fontWeight: 800, color: lvl.color, fontFamily: font, lineHeight: 1 }}>
+                {data.current_load_pct.toFixed(0)}
+              </div>
+              <div style={{ fontSize: 8, color: lvl.color, fontFamily: font }}>%</div>
+            </div>
+            <div>
+              <div style={{ fontSize: 12, fontWeight: 700, color: lvl.color, fontFamily: fontSans }}>{lvl.label}</div>
+              <div style={{ fontSize: 10, color: T.textSm, fontFamily: font }}>от личного максимума</div>
+            </div>
+          </div>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+            <GaugeBar value={data.current_load_pct} color={lvl.color} label="Нагрузка сейчас" sublabel={`${data.weeks_analyzed} нед. истории`} />
+            <GaugeBar value={data.peak_sustainable_pct} color={T.green} label="Устойчивый потолок" sublabel="без потери качества" />
+          </div>
+          {data.already_overworked && (
+            <div style={{ marginTop: 10, padding: '6px 10px', borderRadius: 6, background: `${T.red}12`, border: `1px solid ${T.red}40`, fontSize: 11, color: T.red, fontFamily: fontSans }}>
+              ⚠ Работает сверхурочно
+            </div>
+          )}
+        </Card>
+
+        {/* Резерв / рекомендация */}
+        <Card>
+          <div style={{ fontSize: 11, fontWeight: 700, color: T.textSm, fontFamily: font, textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: 12 }}>
+            Можно добавить задачи?
+          </div>
+
+          {/* Два независимых критерия */}
+          {(() => {
+            const headroomOk = data.headroom_pct >= 10
+            const wipOk      = !data.wip_overloaded && !data.already_overworked
+            const finalOk    = data.can_take_more
+
+            const criteria = [
+              {
+                label: 'По нагрузке',
+                ok: headroomOk,
+                detail: headroomOk
+                  ? `запас ${data.headroom_pct.toFixed(0)}% до потолка`
+                  : data.headroom_pct < 0
+                    ? `превышение на ${Math.abs(data.headroom_pct).toFixed(0)}%`
+                    : `запас всего ${data.headroom_pct.toFixed(0)}%`,
+              },
+              {
+                label: 'По портфелю Jira',
+                ok: wipOk,
+                detail: wipOk
+                  ? data.wip_task_count > 0
+                    ? `${data.wip_task_count} задач в норме`
+                    : 'WIP не превышен'
+                  : data.already_overworked
+                    ? 'работает сверхурочно'
+                    : `WIP ${(data.wip_sp / Math.max(data.wip_avg_weekly_sp, 1)).toFixed(1)}× нормы`,
+              },
+            ]
+
+            return (
+              <>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 8, marginBottom: 14 }}>
+                  {criteria.map(c => (
+                    <div key={c.label} style={{
+                      display: 'flex', alignItems: 'center', gap: 10,
+                      padding: '9px 12px', borderRadius: 8,
+                      background: c.ok ? `${T.green}10` : `${T.red}10`,
+                      border: `1px solid ${c.ok ? T.green : T.red}35`,
+                    }}>
+                      <span style={{ fontSize: 14, color: c.ok ? T.green : T.red, flexShrink: 0 }}>
+                        {c.ok ? '✓' : '✕'}
+                      </span>
+                      <div>
+                        <div style={{ fontSize: 12, fontWeight: 700, color: c.ok ? T.green : T.red, fontFamily: fontSans }}>{c.label}</div>
+                        <div style={{ fontSize: 10, color: T.textMd, fontFamily: font, marginTop: 1 }}>{c.detail}</div>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+
+                {/* Итог */}
+                <div style={{
+                  display: 'flex', alignItems: 'center', gap: 10,
+                  padding: '10px 14px', borderRadius: 8,
+                  background: finalOk ? `${T.green}15` : `${T.red}15`,
+                  border: `1px solid ${finalOk ? T.green : T.red}50`,
+                  marginBottom: 12,
+                }}>
+                  <span style={{ fontSize: 18 }}>{finalOk ? '✓' : '✕'}</span>
+                  <span style={{ fontSize: 13, fontWeight: 800, color: finalOk ? T.green : T.red, fontFamily: fontSans }}>
+                    {finalOk ? 'Да, можно добавить задачи' : 'Нет — нельзя добавлять'}
+                  </span>
+                </div>
+              </>
+            )
+          })()}
+
+          <div style={{ fontSize: 10, color: T.textSm, fontFamily: font }}>
+            Уверенность: {CONFIDENCE_LABEL[data.confidence]} · {data.weeks_analyzed} нед. данных
+          </div>
+        </Card>
+      </div>
+
+      {/* ── Прогноз на следующий спринт ── */}
+      {data.sprint_scenarios?.length > 0 && (
+        <Card>
+          <div style={{ fontSize: 13, fontWeight: 700, color: T.text, fontFamily: fontSans, marginBottom: 4 }}>
+            Прогноз качества при увеличении нагрузки
+          </div>
+          <div style={{ fontSize: 11, color: T.textSm, fontFamily: font, marginBottom: 16 }}>
+            Линейная регрессия по {data.weeks_analyzed} неделям истории. Показывает ожидаемое quality_score при разных сценариях нагрузки.
+          </div>
+          <div style={{ display: 'grid', gridTemplateColumns: `repeat(${data.sprint_scenarios.length}, 1fr)`, gap: 10 }}>
+            {data.sprint_scenarios.map((s, i) => {
+              const rc = RISK_COLOR[s.risk] || T.textMd
+              const isBase = i === 0
+              return (
+                <div key={i} style={{
+                  padding: '14px 16px', borderRadius: 10,
+                  background: isBase ? `${T.accentLt}10` : T.bg,
+                  border: `1px solid ${isBase ? T.accentLt : rc}40`,
+                  position: 'relative',
+                }}>
+                  {isBase && (
+                    <div style={{ position: 'absolute', top: 8, right: 8, fontSize: 9, color: T.accentLt, fontFamily: font, fontWeight: 700 }}>СЕЙЧАС</div>
+                  )}
+                  <div style={{ fontSize: 11, color: T.textSm, fontFamily: font, marginBottom: 8 }}>{s.label}</div>
+                  <div style={{ fontSize: 28, fontWeight: 800, color: rc, fontFamily: font, lineHeight: 1, marginBottom: 4 }}>
+                    {s.predicted_quality.toFixed(0)}
+                  </div>
+                  <div style={{ fontSize: 10, color: T.textSm, fontFamily: font, marginBottom: 8 }}>ожид. качество</div>
+                  <div style={{ height: 4, borderRadius: 2, background: T.border, overflow: 'hidden', marginBottom: 8 }}>
+                    <div style={{ height: '100%', width: `${s.predicted_quality}%`, background: rc, borderRadius: 2 }} />
+                  </div>
+                  <div style={{ fontSize: 10, color: rc, fontFamily: font, fontWeight: 600 }}>
+                    нагрузка {s.load_pct.toFixed(0)}% · риск {s.risk === 'low' ? 'низкий' : s.risk === 'medium' ? 'средний' : 'высокий'}
+                  </div>
+                </div>
+              )
+            })}
+          </div>
+        </Card>
+      )}
+
+      {/* ── График: нагрузка vs качество ── */}
+      <Card>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 14 }}>
+          <div style={{ fontSize: 13, fontWeight: 700, color: T.text, fontFamily: fontSans }}>
+            Динамика нагрузки и качества
+          </div>
+          <div style={{ fontSize: 11, fontFamily: font, color: sensColor, background: `${sensColor}14`, border: `1px solid ${sensColor}40`, borderRadius: 6, padding: '3px 10px' }}>
+            Качество {sensLabel}
+          </div>
+        </div>
+        <ResponsiveContainer width="100%" height={200}>
+          <LineChart data={chartData} margin={{ top: 4, right: 8, bottom: 0, left: -20 }}>
+            <CartesianGrid strokeDasharray="3 3" stroke={T.border} />
+            <XAxis dataKey="week" tick={{ fill: T.textSm, fontSize: 10, fontFamily: font }} />
+            <YAxis domain={[0, 100]} tick={{ fill: T.textSm, fontSize: 10, fontFamily: font }} />
+            <Tooltip content={<ChartTooltip />} />
+            <Legend wrapperStyle={{ fontSize: 11, fontFamily: font }} />
+            <ReferenceLine y={data.peak_sustainable_pct} stroke={T.green} strokeDasharray="4 2"
+              label={{ value: 'потолок', fill: T.green, fontSize: 9, fontFamily: font, position: 'right' }} />
+            <Line type="monotone" dataKey="Нагрузка %" stroke={T.amber}  dot={false} strokeWidth={2} />
+            <Line type="monotone" dataKey="Качество"   stroke={T.purple} dot={false} strokeWidth={2} strokeDasharray="4 2" />
+          </LineChart>
+        </ResponsiveContainer>
+      </Card>
+
+      {/* ── WIP Jira ── */}
+      {data.wip_task_count > 0 ? (
+        <Card style={{ border: `1px solid ${data.wip_overloaded ? T.red : T.border}55` }}>
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 14 }}>
+            <div style={{ fontSize: 13, fontWeight: 700, color: T.text, fontFamily: fontSans }}>Открытые задачи Jira (в работе сейчас)</div>
+            {data.wip_overloaded && <span style={{ fontSize: 11, fontFamily: font, fontWeight: 700, color: T.red, background: `${T.red}14`, border: `1px solid ${T.red}40`, borderRadius: 6, padding: '3px 10px' }}>⚠ Перегружен</span>}
+          </div>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3,1fr)', gap: 12 }}>
+            {[
+              { label: 'Открытых задач',       value: data.wip_task_count,                                                                 suffix: '',    color: T.text,                                    sub: 'статус не Done' },
+              { label: 'Story Points в работе', value: data.wip_sp.toFixed(0),                                                              suffix: ' SP', color: data.wip_overloaded ? T.red : T.amber,    sub: `норма ≈ ${data.wip_avg_weekly_sp.toFixed(0)} SP/нед.` },
+              { label: 'Кратность нормы',       value: data.wip_avg_weekly_sp > 0 ? (data.wip_sp / data.wip_avg_weekly_sp).toFixed(1) : '—', suffix: '×',  color: data.wip_overloaded ? T.red : T.green,    sub: data.wip_overloaded ? 'выше нормы в 2+ раза' : 'в пределах нормы' },
+            ].map(({ label, value, suffix, color, sub }) => (
+              <div key={label} style={{ padding: '12px 14px', borderRadius: 8, background: T.bg, border: `1px solid ${T.border}` }}>
+                <div style={{ fontSize: 24, fontWeight: 800, color, fontFamily: font, lineHeight: 1 }}>{value}<span style={{ fontSize: 13 }}>{suffix}</span></div>
+                <div style={{ fontSize: 11, color: T.textMd, fontFamily: fontSans, marginTop: 4 }}>{label}</div>
+                <div style={{ fontSize: 10, color: T.textSm, fontFamily: font, marginTop: 2 }}>{sub}</div>
+              </div>
+            ))}
+          </div>
+        </Card>
+      ) : (
+        <div style={{ padding: '10px 14px', borderRadius: 8, background: T.surface, border: `1px solid ${T.border}`, fontSize: 12, color: T.textSm, fontFamily: font }}>
+          Jira: открытых задач не найдено (или Jira не подключена)
+        </div>
+      )}
+
+      {/* ── Что формирует нагрузку ── */}
+      {data.top_load_drivers?.length > 0 && (
+        <Card>
+          <div style={{ fontSize: 13, fontWeight: 700, color: T.text, fontFamily: fontSans, marginBottom: 4 }}>Что формирует нагрузку сейчас</div>
+          <div style={{ fontSize: 11, color: T.textSm, fontFamily: font, marginBottom: 14 }}>
+            Метрики с наибольшим отклонением от личной нормы (адаптивные z-score веса)
+          </div>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+            {data.top_load_drivers.map((d, i) => {
+              const isHigh = d.direction === 'выше нормы'
+              const color  = isHigh ? T.amber : T.accentLt
+              const barW   = Math.min(100, Math.abs(d.z_score) / 3 * 100)
+              return (
+                <div key={i}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 4 }}>
+                    <span style={{ fontSize: 12, fontWeight: 600, color: T.text, fontFamily: fontSans }}>{d.metric}</span>
+                    <span style={{ fontSize: 11, color, fontFamily: font, fontWeight: 600 }}>{isHigh ? '↑' : '↓'} {d.direction}</span>
+                  </div>
+                  <div style={{ height: 5, background: T.border, borderRadius: 3, overflow: 'hidden' }}>
+                    <div style={{ height: '100%', width: `${barW}%`, background: color, borderRadius: 3, transition: 'width 0.4s ease' }} />
+                  </div>
+                  <div style={{ fontSize: 10, color: T.textSm, fontFamily: font, marginTop: 3 }}>
+                    z = {d.z_score > 0 ? '+' : ''}{d.z_score.toFixed(2)} — отклонение от личной нормы
+                  </div>
+                </div>
+              )
+            })}
+          </div>
+        </Card>
+      )}
+    </div>
+  )
+}
+
 // ── Основной компонент ────────────────────────────────────────────────────────
 
 export default function DeveloperDetail({ devId, developers, teams, onEdit, onSync }) {
@@ -455,7 +904,6 @@ export default function DeveloperDetail({ devId, developers, teams, onEdit, onSy
     { subject: 'Поставка',     value: +latest.delivery_score.toFixed(1) },
     { subject: 'Качество',     value: +latest.quality_score.toFixed(1) },
     { subject: 'Коллаборация', value: +latest.collaboration_score.toFixed(1) },
-    { subject: 'Стабильность', value: +latest.consistency_score.toFixed(1) },
   ] : []
   const actData = daily.slice(-21).map(d => ({
     день:    d.date?.slice(5, 10),
@@ -468,6 +916,7 @@ export default function DeveloperDetail({ devId, developers, teams, onEdit, onSy
   const TABS = [
     { id: 'overview',   label: 'Обзор' },
     { id: 'biweekly',   label: 'История (2 нед.)' },
+    { id: 'workload',   label: 'Эффективность' },
     { id: 'prs',        label: 'Pull Requests' },
     { id: 'one_on_one', label: '1:1 Помощник' },
   ]
@@ -527,12 +976,11 @@ export default function DeveloperDetail({ devId, developers, teams, onEdit, onSy
                         <ScoreRing value={latest.overall_score} size={60} stroke={6} />
                       </div>
                     </div>
-                    <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4,1fr)', gap: 1, background: T.border, borderRadius: 8, overflow: 'hidden' }}>
+                    <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3,1fr)', gap: 1, background: T.border, borderRadius: 8, overflow: 'hidden' }}>
                       {[
                         { label: 'Поставка',     v: latest.delivery_score,      color: T.green  },
                         { label: 'Качество',     v: latest.quality_score,       color: T.purple },
                         { label: 'Коллаборация', v: latest.collaboration_score, color: T.amber  },
-                        { label: 'Стабильность', v: latest.consistency_score,   color: T.cyan   },
                       ].map(({ label, v, color }) => (
                         <div key={label} style={{ background: T.card, padding: '14px 8px', textAlign: 'center' }}>
                           <div style={{ fontSize: 24, fontWeight: 800, color, fontFamily: font }}>{v.toFixed(0)}</div>
@@ -640,6 +1088,10 @@ export default function DeveloperDetail({ devId, developers, teams, onEdit, onSy
               </div>
               <BiWeeklyHistory devId={devId} />
             </div>
+          )}
+
+          {tab === 'workload' && (
+            <EfficiencyPanel devId={devId} />
           )}
 
           {tab === 'prs' && (

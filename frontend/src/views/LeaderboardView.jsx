@@ -157,7 +157,6 @@ export default function PerformanceView({ teams, onSelectDev }) {
                           <MetricBar label="Скорость"     value={row.task_velocity_score}    color='#8b5cf6' />
                           <MetricBar label="Вовлечённость" value={row.engagement_depth_score} color='#10b981' />
                           <MetricBar label="Код"          value={row.code_health_score}      color='#f59e0b' />
-                          <MetricBar label="Ритм"         value={row.rhythm_score}           color='#06b6d4' />
                         </div>
 
                         {/* Риск-бейджи (только если не low) */}

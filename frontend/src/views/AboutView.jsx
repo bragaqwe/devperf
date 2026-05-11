@@ -129,28 +129,14 @@ export default function AboutView() {
           </>}
         />
 
-        <Score
-          label="Стабильность" color={T.cyan}
-          value="= rhythm_score"
-          desc={<>
-            Равномерность рабочего дня в течение недели. Для каждого активного дня вычисляется
-            "рабочий пролёт" (span) — разница между первым и последним событием в часах.
-            <code style={S.formula}>
-              variance    = std(daily_spans)  // стандартное отклонение по дням<br/>
-              rhythm_score = max(0, 100 − (variance / 4h) × 100)
-            </code>
-            std = 0ч означает идеально одинаковый график. std ≥ 4ч — хаотичный: один день 12 часов,
-            другой 2. Это сигнал перегрузки или нестабильного рабочего процесса.
-          </>}
-        />
-
         <div style={{ ...S.card, borderTop: `2px solid ${T.border}` }}>
           <div style={S.cardTitle}>Итоговый Overall Score</div>
           <code style={S.formula}>
-            overall = delivery×0.30 + quality×0.25 + collaboration×0.25 + consistency×0.20
+            overall = delivery×0.40 + quality×0.30 + collaboration×0.30
           </code>
           <div style={S.cardBody}>
-            Веса отражают приоритет: поставка — главное, стабильность — сигнал о процессе, не о результате.
+            Поставка имеет наибольший вес — это главный результат работы разработчика.
+            Качество и Коллаборация равнозначны.
           </div>
         </div>
       </div>

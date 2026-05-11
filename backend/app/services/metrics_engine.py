@@ -111,7 +111,6 @@ def compute_performance_score(
     task_velocity   = _task_velocity(daily_metrics, baseline)
     engagement      = _engagement_depth(comment_lengths, task_complexities, baseline)
     code_health     = _code_health(daily_metrics, pr_rework_count, pr_total)
-    rhythm          = _rhythm(activity_timestamps)
     recovery        = _recovery_pattern(daily_metrics, vacation_periods, activity_timestamps)
     burnout         = _burnout_signals(activity_timestamps, daily_metrics)
     attrition       = _attrition_signals(
@@ -119,42 +118,39 @@ def compute_performance_score(
         responsiveness_score=responsiveness["responsiveness_score"],
         engagement_depth_score=engagement["engagement_depth_score"],
         burnout_risk_score=burnout["burnout_risk_score"],
-        rhythm_score=rhythm["rhythm_score"],
         prev_weeks_metrics=prev_weeks_metrics,
     )
 
     # Сводные score для UI (0–100)
+    # Стабильность удалена — метрика меряла паттерн коммитов, а не реальный ритм работы
     delivery_score      = task_velocity["task_velocity_score"]
     quality_score       = code_health["code_health_score"]
     collaboration_score = (
         engagement["engagement_depth_score"] * 0.6
         + responsiveness["responsiveness_score"] * 0.4
     )
-    consistency_score   = rhythm["rhythm_score"]
     velocity_trend      = momentum["momentum"]  # -1..+1
     overall_score       = round(
-        delivery_score * 0.3
-        + quality_score * 0.25
-        + collaboration_score * 0.25
-        + consistency_score * 0.2,
+        delivery_score      * 0.40
+        + quality_score     * 0.30
+        + collaboration_score * 0.30,
         2,
     )
 
     return {
-        "developer_id":       developer_id,
-        "week_start":         week_start,
-        "delivery_score":     round(delivery_score,      2),
-        "quality_score":      round(quality_score,       2),
-        "collaboration_score": round(collaboration_score, 2),
-        "consistency_score":  round(consistency_score,   2),
-        "velocity_trend":     round(velocity_trend,      3),
-        "overall_score":      overall_score,
+        "developer_id":        developer_id,
+        "week_start":          week_start,
+        "delivery_score":      round(delivery_score,       2),
+        "quality_score":       round(quality_score,        2),
+        "collaboration_score": round(collaboration_score,  2),
+        "consistency_score":   0.0,   # удалено, колонка сохранена для совместимости с БД
+        "velocity_trend":      round(velocity_trend,       3),
+        "overall_score":       overall_score,
         **momentum,
         **responsiveness,
         **task_velocity,
         **engagement,
         **code_health,
-        **rhythm,
         **recovery,
         **burnout,
         **attrition,
@@ -351,43 +347,6 @@ def _code_health(
 
 # ══════════════════════════════════════════════════════════════════════════════
 # МЕТРИКА 6: RHYTHM
-# Стабильность паттерна активности
-# ══════════════════════════════════════════════════════════════════════════════
-
-def _rhythm(activity_timestamps: list[datetime]) -> dict:
-    """
-    Rhythm = насколько равномерна активность в течение недели.
-    Низкая вариативность = хороший ритм.
-    Паттерн "то 12ч то ничего" = плохой ритм, сигнал перегрузки.
-    Score 0–100 (100 = идеальный ритм).
-    """
-    if not activity_timestamps:
-        return {"activity_variance": 0.0, "rhythm_score": 50.0}
-
-    # Группируем по дням, считаем активные часы
-    by_day: dict[date, list[datetime]] = {}
-    for t in activity_timestamps:
-        d = t.date()
-        by_day.setdefault(d, []).append(t)
-
-    daily_spans = []
-    for day_ts in by_day.values():
-        span = (max(day_ts) - min(day_ts)).total_seconds() / 3600
-        daily_spans.append(span)
-
-    if len(daily_spans) < 2:
-        return {"activity_variance": 0.0, "rhythm_score": 75.0}
-
-    variance = float(np.std(daily_spans))
-    # variance 0 = идеально, >4ч std = хаос
-    rhythm_score = max(0.0, 100.0 - (variance / 4.0) * 100)
-
-    return {
-        "activity_variance": round(variance,     2),
-        "rhythm_score":      round(rhythm_score, 2),
-    }
-
-
 # ══════════════════════════════════════════════════════════════════════════════
 # МЕТРИКА 7: RECOVERY PATTERN
 # История отпусков и восстановление
@@ -544,25 +503,21 @@ def _attrition_signals(
     responsiveness_score:  float,
     engagement_depth_score: float,
     burnout_risk_score:    float,
-    rhythm_score:          float,
     prev_weeks_metrics:    list[list[dict]],
 ) -> dict:
     """
     Attrition risk — детерминированная модель на основе сигналов.
 
     Сигналы (каждый 0–1):
-    1. momentum_decline:    momentum падает 3+ недели подряд
+    1. momentum_decline:    momentum падает vs baseline
     2. engagement_drop:     engagement_depth упал на 40%+ vs baseline
     3. responsiveness_drop: responsiveness упала вдвое
-    4. burnout_combo:       burnout high + низкий rhythm
+    4. burnout_combo:       высокий burnout
     5. isolation:           резкое снижение reviews_given
-
-    Итоговый score = взвешенная сумма.
     """
-    signals      = []
     signal_texts = []
 
-    # 1. Momentum decline — смотрим тренд за последние недели
+    # 1. Momentum decline
     momentum_signal = 0.0
     if momentum < -0.2:
         momentum_signal = min(abs(momentum), 1.0)
@@ -580,11 +535,11 @@ def _attrition_signals(
         responsiveness_signal = (35 - responsiveness_score) / 35
         signal_texts.append(f"Responsiveness упала: {responsiveness_score:.0f}/100")
 
-    # 4. Burnout combo: высокий burnout + плохой ритм
+    # 4. Burnout (без rhythm — удалена)
     burnout_combo = 0.0
-    if burnout_risk_score >= 0.65 and rhythm_score < 40:
+    if burnout_risk_score >= 0.65:
         burnout_combo = burnout_risk_score * 0.8
-        signal_texts.append("Высокий burnout при нестабильном ритме работы")
+        signal_texts.append(f"Высокий риск выгорания: {burnout_risk_score:.0%}")
 
     # 5. Isolation: снижение reviews_given
     isolation_signal = 0.0
@@ -732,18 +687,6 @@ def generate_one_on_one_report(
         elif eng_delta > 15:
             highlights.append("Качество ревью и сложность задач выросли — заметный прогресс")
 
-        # Rhythm
-        rhythm_delta = (
-            current_score.get("rhythm_score", 50)
-            - prev_score.get("rhythm_score", 50)
-        )
-        if rhythm_delta < -20:
-            changes.append({
-                "category": "workload",
-                "signal":   "Ритм работы стал нестабильным — большие перепады активности",
-                "question": "Как ощущается нагрузка? Есть ли дни когда работать невозможно?",
-            })
-
         # Recovery
         days_since = current_score.get("days_since_last_vacation")
         if days_since and days_since > 120:
@@ -836,7 +779,7 @@ def compute_grade_promotion_report(
         keys = [
             "momentum", "responsiveness_score", "task_velocity_score",
             "engagement_depth_score", "code_health_score",
-            "rhythm_score", "burnout_risk_score",
+            "burnout_risk_score",
         ]
         return {
             k: round(float(np.mean([s.get(k, 0) for s in scores])), 2)
@@ -932,8 +875,6 @@ def _empty_score(developer_id: int, week_start: datetime) -> dict:
         "code_churn_ratio":         1.0,
         "pr_rework_rate":           0.0,
         "code_health_score":        50.0,
-        "activity_variance":        0.0,
-        "rhythm_score":             50.0,
         "days_since_last_vacation": None,
         "post_vacation_momentum":   None,
         "recovery_score":           50.0,

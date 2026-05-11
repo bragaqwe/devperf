@@ -1,5 +1,5 @@
 from sqlalchemy import (
-    Column, String, Integer, Float, DateTime, Text,
+    Column, String, Integer, Float, Boolean, DateTime, Text,
     ForeignKey, JSON, Enum as SAEnum, Index, UniqueConstraint, BigInteger,
 )
 from sqlalchemy.orm import DeclarativeBase, relationship
@@ -255,6 +255,10 @@ class PerformanceScore(Base):
     burnout_risk_score     = Column(Float, default=0.0)
     burnout_risk_level     = Column(String(20), default="low")
     computed_at            = Column(DateTime(timezone=True), server_default=func.now())
+    # Anomaly detection (Isolation Forest на сырых DailyMetric)
+    week_anomaly_score     = Column(Float,   nullable=True)   # 0–1, выше = аномальнее
+    week_is_anomaly        = Column(Boolean, default=False)
+    week_anomaly_features  = Column(JSON,    nullable=True)   # [{feature, label, direction, deviation, value, mean}]
     developer              = relationship("Developer", back_populates="performance_scores")
     __table_args__ = (
         UniqueConstraint("developer_id", "week_start", name="uq_perf_score_week"),
@@ -279,8 +283,16 @@ class BiWeeklyScore(Base):
     burnout_risk_level     = Column(String(20), default="low")
     after_hours_ratio      = Column(Float, default=0.0)
     weekend_activity_ratio = Column(Float, default=0.0)
-    weeks_included         = Column(Integer, default=2)   # сколько weekly records усреднено
-    delta_overall          = Column(Float, nullable=True) # разница с предыдущим периодом
+    weeks_included         = Column(Integer, default=2)    # сколько weekly records усреднено
+    delta_overall          = Column(Float, nullable=True)  # разница с предыдущим периодом
+    # Внутрипериодная динамика (week2 − week1)
+    intra_overall_delta    = Column(Float, nullable=True)  # изменение overall внутри периода
+    intra_burnout_delta    = Column(Float, nullable=True)  # нарастание выгорания внутри периода
+    intra_delivery_delta   = Column(Float, nullable=True)  # просадка поставки внутри периода
+    # Isolation Forest anomaly detection
+    anomaly_score          = Column(Float, nullable=True)  # 0–1, чем выше — тем аномальнее
+    is_anomaly             = Column(Boolean, default=False)
+    anomaly_features       = Column(JSON, nullable=True)   # [{feature, label, direction, deviation}]
     computed_at            = Column(DateTime(timezone=True), server_default=func.now())
     developer              = relationship("Developer", back_populates="biweekly_scores")
     __table_args__ = (

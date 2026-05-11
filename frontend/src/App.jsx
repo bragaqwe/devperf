@@ -16,7 +16,7 @@ import AboutView       from './views/AboutView'
 const NAV = [
   { id: 'teams',       label: 'Команды',       icon: '◈' },
   { id: 'developers',  label: 'Разработчики',  icon: '◎' },
-  { id: 'leaderboard', label: 'Аналитика',      icon: '◆' },
+  // { id: 'leaderboard', label: 'Аналитика',      icon: '◆' },
   { id: 'about',       label: 'О системе',      icon: '○' },
 ]
 

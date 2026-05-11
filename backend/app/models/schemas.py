@@ -76,6 +76,9 @@ class PerformanceScoreOut(BaseModel):
     burnout_risk_score:     float
     burnout_risk_level:     str
     computed_at:            Optional[datetime] = None
+    week_anomaly_score:     Optional[float] = None
+    week_is_anomaly:        bool = False
+    week_anomaly_features:  Optional[Any] = None
     model_config = {"from_attributes": True}
 
 
@@ -138,6 +141,12 @@ class BiWeeklyScoreOut(BaseModel):
     weekend_activity_ratio: float
     weeks_included:         int
     delta_overall:          Optional[float] = None
+    intra_overall_delta:    Optional[float] = None
+    intra_burnout_delta:    Optional[float] = None
+    intra_delivery_delta:   Optional[float] = None
+    anomaly_score:          Optional[float] = None
+    is_anomaly:             bool = False
+    anomaly_features:       Optional[Any] = None
     computed_at:            Optional[datetime] = None
     model_config = {"from_attributes": True}
 
@@ -263,3 +272,45 @@ class OneOnOneMeetingOut(BaseModel):
     questions:   list[OneOnOneTopic]
     notes:       Optional[str] = None
     model_config = {"from_attributes": True}
+
+
+# ── Capacity / Workload Analysis ───────────────────────────────────────────────
+
+class SprintScenarioOut(BaseModel):
+    label:             str
+    load_pct:          float
+    predicted_quality: float
+    risk:              str   # low / medium / high
+
+
+class CapacityAnalysisOut(BaseModel):
+    # Текущая нагрузка
+    current_load_pct:        float
+    current_load_level:      str
+    # Эффективность
+    efficiency_index:        float   # 0-100
+    efficiency_level:        str     # low / medium / high
+    efficiency_delta:        float   # отклонение от регрессионной линии
+    # Потолок и резерв
+    peak_sustainable_pct:    float
+    headroom_pct:            float
+    can_take_more:           bool
+    # Качество под нагрузкой
+    quality_sensitivity:     float
+    high_load_quality_avg:   float
+    normal_load_quality_avg: float
+    # Burnout
+    already_overworked:      bool
+    # WIP — открытые задачи Jira
+    wip_task_count:          int
+    wip_sp:                  float
+    wip_avg_weekly_sp:       float
+    wip_overloaded:          bool
+    # Прогноз на следующий спринт
+    sprint_scenarios:        list[SprintScenarioOut]
+    # Итог
+    recommendation:          str
+    confidence:              str
+    weeks_analyzed:          int
+    weekly:                  list[dict]
+    top_load_drivers:        list[dict] = []

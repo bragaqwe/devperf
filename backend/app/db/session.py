@@ -21,6 +21,31 @@ AsyncSessionLocal = async_sessionmaker(
 async def init_db():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        # Добавляем новые колонки если таблица уже существовала (idempotent)
+        await _migrate_biweekly_anomaly(conn)
+
+
+async def _migrate_biweekly_anomaly(conn):
+    """Добавляет anomaly-колонки в biweekly_scores если их ещё нет."""
+    from sqlalchemy import text
+    migrations = [
+        # biweekly_scores
+        "ALTER TABLE biweekly_scores ADD COLUMN IF NOT EXISTS anomaly_score FLOAT",
+        "ALTER TABLE biweekly_scores ADD COLUMN IF NOT EXISTS is_anomaly BOOLEAN DEFAULT FALSE",
+        "ALTER TABLE biweekly_scores ADD COLUMN IF NOT EXISTS anomaly_features JSON",
+        "ALTER TABLE biweekly_scores ADD COLUMN IF NOT EXISTS intra_overall_delta FLOAT",
+        "ALTER TABLE biweekly_scores ADD COLUMN IF NOT EXISTS intra_burnout_delta FLOAT",
+        "ALTER TABLE biweekly_scores ADD COLUMN IF NOT EXISTS intra_delivery_delta FLOAT",
+        # performance_scores — weekly anomaly detection
+        "ALTER TABLE performance_scores ADD COLUMN IF NOT EXISTS week_anomaly_score FLOAT",
+        "ALTER TABLE performance_scores ADD COLUMN IF NOT EXISTS week_is_anomaly BOOLEAN DEFAULT FALSE",
+        "ALTER TABLE performance_scores ADD COLUMN IF NOT EXISTS week_anomaly_features JSON",
+    ]
+    for stmt in migrations:
+        try:
+            await conn.execute(text(stmt))
+        except Exception:
+            pass  # колонка уже существует или таблица не создана ещё
 
 
 async def get_db():
